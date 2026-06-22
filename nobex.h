@@ -97,10 +97,11 @@
 #  define NOBEX__UNUSED
 #endif
 
+typedef struct Target Target;
+
 #if defined(__APPLE__)
 #  define NOBEX__SECNAME "__DATA," NOBEX_SECTION_HASH
 #  define NOBEX_SECTION  __attribute__((used, section(NOBEX__SECNAME)))
-   typedef struct Target Target;
    extern Target *__nobex_sec_start __asm("section$start$__DATA$" NOBEX_SECTION_HASH);
    extern Target *__nobex_sec_stop  __asm("section$end$__DATA$"   NOBEX_SECTION_HASH);
 #  define NOBEX_TARGETS_BEGIN (&__nobex_sec_start)
@@ -108,7 +109,6 @@
 
 #elif defined(_WIN32)
 #  define NOBEX_SECTION __declspec(allocate("nob_tg$m"))
-   typedef struct Target Target;
    /* _nobex_win_begin and _nobex_win_end emitted in the implementation block */
    extern Target *_nobex_win_begin;
    extern Target *_nobex_win_end;
@@ -118,7 +118,6 @@
 #else /* ELF (Linux, FreeBSD, …) */
 #  define NOBEX__ELF_SEC "nbx_" NOBEX_SECTION_HASH
 #  define NOBEX_SECTION  __attribute__((used, section(NOBEX__ELF_SEC)))
-   typedef struct Target Target;
    extern Target *__nobex_sec_start __asm("__start_nbx_" NOBEX_SECTION_HASH);
    extern Target *__nobex_sec_stop  __asm("__stop_nbx_"  NOBEX_SECTION_HASH);
 #  define NOBEX_TARGETS_BEGIN (&__nobex_sec_start)
@@ -133,7 +132,7 @@
 typedef struct NobexContext NobexContext;
 typedef struct NobexStore   NobexStore;
 typedef struct NobexWatch   NobexWatch;
-typedef struct Graph        Graph;
+typedef struct NobexGraph   NobexGraph;
 
 typedef enum {
     TARGET_EXECUTABLE,
@@ -181,7 +180,7 @@ struct Target {
     void        (*on_error)(Target*,        NobexContext*);
 };
 
-struct Graph {
+struct NobexGraph {
     Target **items;
     size_t   count;
     size_t   capacity;
@@ -190,7 +189,7 @@ struct Graph {
 typedef struct { Target **items; size_t count; size_t capacity; } _NobexDoneSet;
 
 struct NobexContext {
-    Graph         *graph;
+    NobexGraph         *graph;
     NobexStore    *store;
     int            jobs;
     bool           dry_run;
@@ -375,7 +374,7 @@ const char *nobex_xflags_get(const char *filepath, const char *key)
 
 /* ── Graph: collect, find, validate, resolve_groups ── */
 
-static NOBEX__UNUSED void _nobex_collect_targets(Graph *g)
+static NOBEX__UNUSED void _nobex_collect_targets(NobexGraph *g)
 {
 #if defined(__APPLE__) || !defined(_WIN32)
     /* On ELF/Mach-O the boundary symbols may not exist if no targets were
@@ -393,7 +392,7 @@ static NOBEX__UNUSED void _nobex_collect_targets(Graph *g)
 #endif
 }
 
-static NOBEX__UNUSED Target *_nobex_graph_find(Graph *g, const char *name)
+static NOBEX__UNUSED Target *_nobex_graph_find(NobexGraph *g, const char *name)
 {
     for (size_t i = 0; i < g->count; i++) {
         if (strcmp(g->items[i]->name, name) == 0) return g->items[i];
@@ -414,7 +413,7 @@ const char *nobex_output(NobexContext *ctx, const char *name)
 
 typedef enum { NOBEX_UNVISITED = 0, NOBEX_IN_PROGRESS, NOBEX_DONE } _NobexVisit;
 
-static NOBEX__UNUSED void _nobex_validate_dfs(Graph *g, size_t idx, _NobexVisit *state, bool *ok)
+static NOBEX__UNUSED void _nobex_validate_dfs(NobexGraph *g, size_t idx, _NobexVisit *state, bool *ok)
 {
     if (state[idx] == NOBEX_DONE)        return;
     if (state[idx] == NOBEX_IN_PROGRESS) {
@@ -444,7 +443,7 @@ static NOBEX__UNUSED void _nobex_validate_dfs(Graph *g, size_t idx, _NobexVisit 
     state[idx] = NOBEX_DONE;
 }
 
-static NOBEX__UNUSED bool _nobex_validate_graph(Graph *g)
+static NOBEX__UNUSED bool _nobex_validate_graph(NobexGraph *g)
 {
     _NobexVisit *state = (_NobexVisit*)NOB_REALLOC(NULL, g->count * sizeof(_NobexVisit));
     NOB_ASSERT(state);
@@ -471,7 +470,7 @@ static NOBEX__UNUSED bool _nobex_target_in_group(Target *t, const char *group)
     return false;
 }
 
-static NOBEX__UNUSED bool _nobex_resolve_groups(Graph *g, const char **groups, size_t ngroups, Graph *out)
+static NOBEX__UNUSED bool _nobex_resolve_groups(NobexGraph *g, const char **groups, size_t ngroups, NobexGraph *out)
 {
     for (size_t i = 0; i < g->count; i++) {
         for (size_t j = 0; j < ngroups; j++) {
@@ -574,7 +573,7 @@ static NOBEX__UNUSED bool _nobex_build_executable(Target *t, NobexContext *ctx)
             const char *obj  = nob_temp_sprintf("build/%s.o", base);
 
             const char *chk[] = { src };
-            int needs = nob_needs_rebuild(obj, chk, 1);
+            int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1);
             if (needs < 0) return false;
 
             if (needs || !nob_file_exists(obj)) {
@@ -790,7 +789,7 @@ static NOBEX__UNUSED bool _nobex_target_build(Target *t, NobexContext *ctx)
     return ok;
 }
 
-static NOBEX__UNUSED bool _nobex_graph_run_serial(Graph *g, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_graph_run_serial(NobexGraph *g, NobexContext *ctx)
 {
     for (size_t i = 0; i < g->count; i++) {
         if (!_nobex_target_build(g->items[i], ctx)) return false;
@@ -811,7 +810,7 @@ static DWORD WINAPI _nobex_thread_win(LPVOID arg)
     return 0;
 }
 
-static NOBEX__UNUSED bool _nobex_graph_run_parallel(Graph *g, NobexContext *ctx, int jobs)
+static NOBEX__UNUSED bool _nobex_graph_run_parallel(NobexGraph *g, NobexContext *ctx, int jobs)
 {
     size_t i = 0; bool ok = true;
     while (i < g->count && ok) {
@@ -844,7 +843,7 @@ static void *_nobex_thread_posix(void *arg)
     return NULL;
 }
 
-static NOBEX__UNUSED bool _nobex_graph_run_parallel(Graph *g, NobexContext *ctx, int jobs)
+static NOBEX__UNUSED bool _nobex_graph_run_parallel(NobexGraph *g, NobexContext *ctx, int jobs)
 {
     size_t i = 0; bool ok = true;
     while (i < g->count && ok) {
@@ -867,7 +866,7 @@ static NOBEX__UNUSED bool _nobex_graph_run_parallel(Graph *g, NobexContext *ctx,
 
 #endif /* parallel */
 
-static NOBEX__UNUSED bool _nobex_graph_run(Graph *g, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_graph_run(NobexGraph *g, NobexContext *ctx)
 {
     if (ctx->jobs <= 1) return _nobex_graph_run_serial(g, ctx);
     return _nobex_graph_run_parallel(g, ctx, ctx->jobs);
@@ -882,7 +881,7 @@ bool nobex_run(NobexContext *ctx, const char *name)
 
 /* ── --help and --list ── */
 
-static NOBEX__UNUSED void _nobex_print_help(Graph *g, const char *default_group, const char *prog)
+static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_group, const char *prog)
 {
     printf("Usage: %s [flags] [group...]\n\n", prog);
     const char *seen[256]; size_t n = 0;
@@ -942,7 +941,7 @@ static NOBEX__UNUSED void _nobex_print_help(Graph *g, const char *default_group,
     printf("    --watch        Watch mode (mtime poll)\n");
 }
 
-static NOBEX__UNUSED void _nobex_print_list(Graph *g)
+static NOBEX__UNUSED void _nobex_print_list(NobexGraph *g)
 {
     for (size_t i = 0; i < g->count; i++) {
         Target *t = g->items[i];
@@ -985,7 +984,7 @@ static NOBEX__UNUSED time_t _nobex_file_mtime(const char *path)
 
 typedef struct { const char *path; time_t mtime; } _NobexWatchFile;
 
-static NOBEX__UNUSED bool _nobex_watch_loop(Graph *subgraph, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_watch_loop(NobexGraph *subgraph, NobexContext *ctx)
 {
 #ifdef _WIN32
     SetConsoleCtrlHandler(_nobex_ctrl_handler, TRUE);
@@ -1109,7 +1108,7 @@ int main(int argc, char **argv)
 {
     _nobex_self_rebuild(argc, argv);
 
-    Graph g = {0};
+    NobexGraph g = {0};
     _nobex_collect_targets(&g);
 
     if (g.count == 0) {
@@ -1152,7 +1151,7 @@ int main(int argc, char **argv)
 
     if (ngroups == 0) { req_groups[0] = default_group; ngroups = 1; }
 
-    Graph subgraph = {0};
+    NobexGraph subgraph = {0};
     if (!_nobex_resolve_groups(&g, req_groups, ngroups, &subgraph)) return 1;
 
     NobexStore  store = {0};
@@ -1188,7 +1187,10 @@ static NOBEX__UNUSED void _nobex_cli_exec(const char *binary, int argc, char **a
     for (int i = 0; i < argc; i++) args[i + 1] = argv[i];
     args[argc + 1] = NULL;
     execv(binary, (char* const*)args);
-    nob_log(NOB_ERROR, "nobex: execv failed: %s", strerror(errno));
+    nob_log(NOB_ERROR, "[nobex] execv failed: %s", strerror(errno));
+    fprintf(stderr,"while running cmd: %s", binary);
+    for (int i = 0; i < argc; i++) fprintf(stderr," %s", argv[i]);
+    fprintf(stderr,"\n");
     exit(1);
 #endif
 }
@@ -1218,7 +1220,9 @@ int main(int argc, char **argv)
     nob_minimal_log_level = _cli_saved;
 
     const char *base   = nob_temp_file_name(source);
-    const char *binary = nob_temp_sprintf("%s/%s", NOBEX_CACHE_DIR, base);
+    const char *dot    = strrchr(base, '.');
+    const char *stem   = dot ? nob_temp_sprintf("%.*s", (int)(dot - base), base) : base;
+    const char *binary = nob_temp_sprintf("%s/%s", NOBEX_CACHE_DIR, stem);
 
     int needs = nob_needs_rebuild1(binary, source);
     if (needs < 0) return 1;

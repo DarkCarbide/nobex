@@ -7,10 +7,15 @@
 #define NOBEX_IMPLEMENTATION
 #include "nobex.h"
 
+#define BUILD_DIR "build"
+
 bool clean(NobexContext *ctx)
 {
     (void)ctx;
-    nob_delete_file("nobex");
+    if(nob_file_exists(BUILD_DIR "/nobex")) nob_delete_file(BUILD_DIR "/nobex");
+    if(nob_file_exists(BUILD_DIR "/nobex.h.o")) nob_delete_file(BUILD_DIR "/nobex.h.o");
+    if(nob_file_exists(BUILD_DIR "/test_xflags")) nob_delete_file(BUILD_DIR "/test_xflags");
+    if(nob_file_exists(BUILD_DIR "/test_xflags.c.o")) nob_delete_file(BUILD_DIR "/test_xflags.c.o");
     return true;
 }
 
@@ -18,7 +23,7 @@ NOB_PHONY(clean, .groups = GROUPS("clean"));
 
 NOB_ARTIFACT(nobex,
     .sources    = SRCS("nobex.h"),
-    .output     = "nobex",
+    .output     = BUILD_DIR "/nobex",
     .type       = TARGET_EXECUTABLE,
     .cflags     = FLAGS("-x", "c", "-DNOBEX_CLI"),
     .lflags     = FLAGS("-lpthread"),
@@ -27,9 +32,19 @@ NOB_ARTIFACT(nobex,
 
 NOB_ARTIFACT(test_xflags,
     .sources = SRCS("test_xflags.c"),
-    .output  = "test_xflags",
+    .output  = BUILD_DIR "/test_xflags",
     .type    = TARGET_EXECUTABLE,
 );
+
+bool install(NobexContext *ctx)
+{
+    (void)ctx;
+    if(nob_file_exists(BUILD_DIR "/nobex")) return nob_copy_file(BUILD_DIR "/nobex", "/usr/local/bin/nobex");
+    nob_log(NOB_ERROR,"Could not install because there no executable built");
+    return 0;
+}
+
+NOB_PHONY(install, .deps = DEPS("nobex"), .groups = GROUPS("install"));
 
 bool test(NobexContext *ctx)
 {
@@ -37,7 +52,7 @@ bool test(NobexContext *ctx)
 
     nob_log(NOB_INFO, "Running test cases\n");
     Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, "./test_xflags");
+    nob_cmd_append(&cmd, BUILD_DIR "/test_xflags");
     return nob_cmd_run(&cmd);
 }
 
