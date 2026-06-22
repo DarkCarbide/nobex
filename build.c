@@ -41,4 +41,4 @@ bool test(NobexContext *ctx)
     return nob_cmd_run(&cmd);
 }
 
-NOB_PHONY(test, .groups = GROUPS(NOBEX_DEFAULT_GROUP, "test"));
+NOB_PHONY(test, .groups = GROUPS("test"));

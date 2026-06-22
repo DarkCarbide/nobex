@@ -882,8 +882,9 @@ bool nobex_run(NobexContext *ctx, const char *name)
 
 /* ── --help and --list ── */
 
-static NOBEX__UNUSED void _nobex_print_help(Graph *g, const char *default_group)
+static NOBEX__UNUSED void _nobex_print_help(Graph *g, const char *default_group, const char *prog)
 {
+    printf("Usage: %s [flags] [group...]\n\n", prog);
     const char *seen[256]; size_t n = 0;
 
     for (size_t i = 0; i < g->count; i++) {
@@ -935,10 +936,10 @@ static NOBEX__UNUSED void _nobex_print_help(Graph *g, const char *default_group)
     printf("    --help, -h     Show this help\n");
     printf("    --list, -l     List targets\n");
     printf("    -jN            Parallelism (e.g. -j4)\n");
+    printf("    -B             Force rebuild, ignore mtimes\n");
     printf("    --dry-run      Print commands without executing\n");
     printf("    --verbose, -v  Print each command before running\n");
     printf("    --watch        Watch mode (mtime poll)\n");
-    printf("    [group...]     Groups to build\n");
 }
 
 static NOBEX__UNUSED void _nobex_print_list(Graph *g)
@@ -1061,12 +1062,17 @@ static NOBEX__UNUSED void _nobex_self_rebuild(int argc, char **argv)
     const char *sources[] = { "nob.c", "build.c", NULL };
     const char *binary    = argv[0];
 
+    /* suppress INFO noise (e.g. mkdir) while only doing mtime checks */
+    Nob_Log_Level saved = nob_minimal_log_level;
+    nob_minimal_log_level = NOB_WARNING;
+
     for (size_t i = 0; sources[i]; i++) {
         if (!nob_file_exists(sources[i])) continue;
         int r = nob_needs_rebuild1(binary, sources[i]);
         if (r < 0) exit(1);
-        if (!r) break;
+        if (!r) { nob_minimal_log_level = saved; break; }
 
+        nob_minimal_log_level = saved;
         nob_log(NOB_INFO, "nobex: rebuilding %s -> %s", sources[i], binary);
 
         const char *old = nob_temp_sprintf("%s.old", binary);
@@ -1141,7 +1147,7 @@ int main(int argc, char **argv)
 
     const char *default_group = _nobex_default_group ? _nobex_default_group : "build";
 
-    if (show_help) { _nobex_print_help(&g, default_group); return 0; }
+    if (show_help) { _nobex_print_help(&g, default_group, argv[0]); return 0; }
     if (show_list) { _nobex_print_list(&g); return 0; }
 
     if (ngroups == 0) { req_groups[0] = default_group; ngroups = 1; }
@@ -1206,7 +1212,10 @@ int main(int argc, char **argv)
         }
     }
 
+    Nob_Log_Level _cli_saved = nob_minimal_log_level;
+    nob_minimal_log_level = NOB_WARNING;
     nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
+    nob_minimal_log_level = _cli_saved;
 
     const char *base   = nob_temp_file_name(source);
     const char *binary = nob_temp_sprintf("%s/%s", NOBEX_CACHE_DIR, base);
