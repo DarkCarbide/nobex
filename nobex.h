@@ -161,9 +161,11 @@ struct NobexWatch {
 
 /* Target — full definition (forward-declared in section D) */
 struct NobexTarget {
-    const char   *name;        // name of the target, used to find dependency relations
+    const char   *name;
+    const char   *description;
     TargetType    type;
     const char  **sources;
+    const char  **inputs;
     const char   *output;
     const char  **deps;
     const char  **cflags;
@@ -171,7 +173,6 @@ struct NobexTarget {
     const char  **packages;
     const char  **groups;
     bool          use_xflags;
-    bool          is_default;
     NobexWatch    watch;
     bool        (*run)(NobexTarget*, NobexContext*);
     bool        (*phony)(NobexContext*);
@@ -232,11 +233,13 @@ struct NobexContext {
  * G — Helper macros
  * ========================================================= */
 
-#define SRCS(...)   ((const char*[]){__VA_ARGS__, NULL})
-#define DEPS(...)   ((const char*[]){__VA_ARGS__, NULL})
-#define FLAGS(...)  ((const char*[]){__VA_ARGS__, NULL})
-#define PKGS(...)   ((const char*[]){__VA_ARGS__, NULL})
-#define GROUPS(...) ((const char*[]){__VA_ARGS__, NULL})
+#define LIST(...)   ((const char*[]){__VA_ARGS__, NULL})
+#define SRCS(...)   LIST(__VA_ARGS__)
+#define DEPS(...)   LIST(__VA_ARGS__)
+#define FLAGS(...)  LIST(__VA_ARGS__)
+#define PKGS(...)   LIST(__VA_ARGS__)
+#define GROUPS(...) LIST(__VA_ARGS__)
+#define INPUTS(...) LIST(__VA_ARGS__)
 
 /* =========================================================
  * H — Public API declarations
@@ -558,10 +561,19 @@ static NOBEX__UNUSED bool _nobex_needs_rebuild(NobexTarget *t, NobexContext *ctx
 {
     if (ctx->force) return true;
     if (!t->output) return true;
-    if (!t->sources) return true;
-    size_t nsrc = 0;
-    while (t->sources[nsrc]) nsrc++;
-    int r = nob_needs_rebuild(t->output, t->sources, nsrc);
+    if (!t->sources && !t->inputs) return true;
+
+    /* collect sources + inputs into a single array for the mtime check */
+    size_t nsrc = 0, ninp = 0;
+    if (t->sources) while (t->sources[nsrc]) nsrc++;
+    if (t->inputs)  while (t->inputs[ninp])  ninp++;
+
+    const char **all = (const char **)NOB_REALLOC(NULL, (nsrc + ninp) * sizeof(char *));
+    for (size_t i = 0; i < nsrc; i++) all[i]        = t->sources[i];
+    for (size_t i = 0; i < ninp; i++) all[nsrc + i] = t->inputs[i];
+
+    int r = nob_needs_rebuild(t->output, all, nsrc + ninp);
+    NOB_FREE(all);
     return r < 0 ? true : (bool)r;
 }
 
@@ -581,8 +593,13 @@ static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *
             const char *base = nob_path_name(src);
             const char *obj  = nob_temp_sprintf("build/%s.o", base);
 
-            const char *chk[] = { src };
-            int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1);
+            size_t ninp = 0;
+            if (t->inputs) while (t->inputs[ninp]) ninp++;
+            const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
+            chk[0] = src;
+            for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
+            int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
+            NOB_FREE(chk);
             if (needs < 0) return false;
 
             if (needs || !nob_file_exists(obj)) {
@@ -892,7 +909,7 @@ bool nobex_run(NobexContext *ctx, const char *name)
 
 static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_group, const char *prog)
 {
-    printf("Usage: %s [flags] [group...]\n\n", prog);
+    printf("Usage: %s [flags] [target|@group...]\n\n", prog);
     const char *seen[256]; size_t n = 0;
 
     for (size_t i = 0; i < g->count; i++) {
@@ -934,12 +951,14 @@ static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_g
             default: break;
         }
         printf("    %-20s %-12s", t->name, ts);
-        if (t->is_default) printf(" (default)");
         if (t->use_xflags) printf(" xflags:on");
         if (!t->watch.skip && t->type != TARGET_PHONY) printf(" watch:on");
         printf("\n");
     }
 
+    printf("\nArguments:\n");
+    printf("    target         Build a named target directly\n");
+    printf("    @group         Build all targets in a group\n");
     printf("\nFlags:\n");
     printf("    --help, -h     Show this help\n");
     printf("    --list, -l     List targets\n");
@@ -954,12 +973,13 @@ static NOBEX__UNUSED void _nobex_print_list(NobexGraph *g)
 {
     for (size_t i = 0; i < g->count; i++) {
         NobexTarget *t = g->items[i];
-        printf("%s", t->name);
+        printf("%-20s", t->name);
         if (t->groups) {
             printf("  [");
             for (size_t j = 0; t->groups[j]; j++) { if (j) printf(","); printf("%s", t->groups[j]); }
             printf("]");
         } else { printf("  [%s]", _nobex_default_group ? _nobex_default_group : "build"); }
+        if (t->description) printf("  %s", t->description);
         printf("\n");
     }
 }
@@ -1130,8 +1150,8 @@ int main(int argc, char **argv)
     bool dry_run = false, verbose = false, watch = false, force = false;
     bool show_help = false, show_list = false;
     int  jobs = 1;
-    const char *req_groups[64];
-    size_t ngroups = 0;
+    const char *req_args[64];  /* positional args: "name" = target, "@group" = group */
+    size_t nargs = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -1147,8 +1167,8 @@ int main(int argc, char **argv)
             } else if (i + 1 < argc) {
                 jobs = _nobex_parse_jobs(argv[++i]);
             }
-        } else if (a[0] != '-' && ngroups < 64) {
-            req_groups[ngroups++] = a;
+        } else if (a[0] != '-' && nargs < 64) {
+            req_args[nargs++] = a;
         } else {
             nob_log(NOB_WARNING, "nobex: unknown flag '%s'", a);
         }
@@ -1159,23 +1179,52 @@ int main(int argc, char **argv)
     if (show_help) { _nobex_print_help(&g, default_group, argv[0]); return 0; }
     if (show_list) { _nobex_print_list(&g); return 0; }
 
-    if (ngroups == 0) { req_groups[0] = default_group; ngroups = 1; }
+    /* default: run the default group */
+    if (nargs == 0) { req_args[0] = nob_temp_sprintf("@%s", default_group); nargs = 1; }
 
-    NobexGraph subgraph = {0};
-    if (!_nobex_resolve_groups(&g, req_groups, ngroups, &subgraph)) return 1;
-
-    NobexStore  store = {0};
-    NobexContext ctx  = { .graph = &g, .store = &store,
-                          .jobs = jobs, .dry_run = dry_run, .verbose = verbose,
-                          .force = force };
+    NobexStore   store = {0};
+    NobexContext ctx   = { .graph = &g, .store = &store,
+                           .jobs = jobs, .dry_run = dry_run, .verbose = verbose,
+                           .force = force };
 
     Nob_Log_Level saved = nob_minimal_log_level;
     nob_minimal_log_level = NOB_WARNING;
     nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
     nob_minimal_log_level = saved;
 
-    if (watch) return _nobex_watch_loop(&subgraph, &ctx) ? 0 : 1;
-    return _nobex_graph_run(&subgraph, &ctx) ? 0 : 1;
+    /* execute positional args in order */
+    for (size_t i = 0; i < nargs; i++) {
+        const char *a = req_args[i];
+        if (a[0] == '@') {
+            /* group — expand and run all matching targets in graph order */
+            const char *grp = a + 1;
+            bool found = false;
+            for (size_t j = 0; j < g.count; j++) {
+                if (_nobex_target_in_group(g.items[j], grp)) {
+                    found = true;
+                    if (!_nobex_target_build(g.items[j], &ctx)) return 1;
+                }
+            }
+            if (!found) {
+                nob_log(NOB_ERROR, "nobex: no targets found for group '%s'", grp);
+                return 1;
+            }
+        } else {
+            /* named target */
+            NobexTarget *t = _nobex_graph_find(&g, a);
+            if (!t) {
+                nob_log(NOB_ERROR, "nobex: target '%s' not found", a);
+                return 1;
+            }
+            if (watch) {
+                nob_log(NOB_WARNING, "nobex: --watch is not supported with named targets");
+                return 1;
+            }
+            if (!_nobex_target_build(t, &ctx)) return 1;
+        }
+    }
+
+    return 0;
 }
 
 #endif /* NOBEX_IMPLEMENTATION */

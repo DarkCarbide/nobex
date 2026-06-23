@@ -19,21 +19,24 @@ bool clean(NobexContext *ctx)
     return true;
 }
 
-NOB_PHONY(clean, .groups = GROUPS("clean"));
+NOB_PHONY(clean, .groups = GROUPS("clean"), .description = "remove build artifacts");
 
 NOB_ARTIFACT(nobex,
-    .sources    = SRCS("nobex.h"),
-    .output     = BUILD_DIR "/nobex",
-    .type       = TARGET_EXECUTABLE,
-    .cflags     = FLAGS("-x", "c", "-DNOBEX_CLI"),
-    .lflags     = FLAGS("-lpthread"),
-    .is_default = true,
+    .sources     = SRCS("nobex.h"),
+    .inputs      = INPUTS("nob.h"),
+    .output      = BUILD_DIR "/nobex",
+    .type        = TARGET_EXECUTABLE,
+    .cflags      = FLAGS("-x", "c", "-DNOBEX_CLI"),
+    .lflags      = FLAGS("-lpthread"),
+    .description = "standalone nobex CLI binary",
 );
 
 NOB_ARTIFACT(test_xflags,
-    .sources = SRCS("test_xflags.c"),
-    .output  = BUILD_DIR "/test_xflags",
-    .type    = TARGET_EXECUTABLE,
+    .sources     = SRCS("test_xflags.c"),
+    .inputs      = INPUTS("nobex.h", "nob.h"),
+    .output      = BUILD_DIR "/test_xflags",
+    .type        = TARGET_EXECUTABLE,
+    .description = "xflags parser unit tests",
 );
 
 bool install(NobexContext *ctx)
@@ -44,7 +47,7 @@ bool install(NobexContext *ctx)
     return 0;
 }
 
-NOB_PHONY(install, .deps = DEPS("nobex"), .groups = GROUPS("install"));
+NOB_PHONY(install, .deps = DEPS("nobex"), .groups = GROUPS("install"), .description = "install nobex to /usr/local/bin");
 
 bool test(NobexContext *ctx)
 {
@@ -56,4 +59,4 @@ bool test(NobexContext *ctx)
     return nob_cmd_run(&cmd);
 }
 
-NOB_PHONY(test, .groups = GROUPS("test"));
+NOB_PHONY(test, .groups = GROUPS("test"), .description = "build and run test_xflags");
