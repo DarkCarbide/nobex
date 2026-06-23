@@ -97,29 +97,29 @@
 #  define NOBEX__UNUSED
 #endif
 
-typedef struct Target Target;
+typedef struct NobexTarget NobexTarget;
 
 #if defined(__APPLE__)
 #  define NOBEX__SECNAME "__DATA," NOBEX_SECTION_HASH
 #  define NOBEX_SECTION  __attribute__((used, section(NOBEX__SECNAME)))
-   extern Target *__nobex_sec_start __asm("section$start$__DATA$" NOBEX_SECTION_HASH);
-   extern Target *__nobex_sec_stop  __asm("section$end$__DATA$"   NOBEX_SECTION_HASH);
+   extern NobexrTarget *__nobex_sec_start __asm("section$start$__DATA$" NOBEX_SECTION_HASH);
+   extern NobexTarget *__nobex_sec_stop  __asm("section$end$__DATA$"   NOBEX_SECTION_HASH);
 #  define NOBEX_TARGETS_BEGIN (&__nobex_sec_start)
 #  define NOBEX_TARGETS_END   (&__nobex_sec_stop)
 
 #elif defined(_WIN32)
 #  define NOBEX_SECTION __declspec(allocate("nob_tg$m"))
    /* _nobex_win_begin and _nobex_win_end emitted in the implementation block */
-   extern Target *_nobex_win_begin;
-   extern Target *_nobex_win_end;
+   extern NobexTarget *_nobex_win_begin;
+   extern NobexTarget *_nobex_win_end;
 #  define NOBEX_TARGETS_BEGIN (&_nobex_win_begin + 1)
 #  define NOBEX_TARGETS_END   (&_nobex_win_end)
 
 #else /* ELF (Linux, FreeBSD, …) */
 #  define NOBEX__ELF_SEC "nbx_" NOBEX_SECTION_HASH
 #  define NOBEX_SECTION  __attribute__((used, section(NOBEX__ELF_SEC)))
-   extern Target *__nobex_sec_start __asm("__start_nbx_" NOBEX_SECTION_HASH);
-   extern Target *__nobex_sec_stop  __asm("__stop_nbx_"  NOBEX_SECTION_HASH);
+   extern NobexTarget *__nobex_sec_start __asm("__start_nbx_" NOBEX_SECTION_HASH);
+   extern NobexTarget *__nobex_sec_stop  __asm("__stop_nbx_"  NOBEX_SECTION_HASH);
 #  define NOBEX_TARGETS_BEGIN (&__nobex_sec_start)
 #  define NOBEX_TARGETS_END   (&__nobex_sec_stop)
 #endif
@@ -154,14 +154,14 @@ struct NobexWatch {
     bool     skip_hooks;
     uint32_t debounce_ms;
     uint32_t poll_ms;
-    void   (*on_change)(Target*, NobexContext*);
-    void   (*on_built)(Target*,  NobexContext*);
-    void   (*on_error)(Target*,  NobexContext*);
+    void   (*on_change)(NobexTarget*, NobexContext*);
+    void   (*on_built)(NobexTarget*,  NobexContext*);
+    void   (*on_error)(NobexTarget*,  NobexContext*);
 };
 
 /* Target — full definition (forward-declared in section D) */
-struct Target {
-    const char   *name;
+struct NobexTarget {
+    const char   *name;        // name of the target, used to find dependency relations
     TargetType    type;
     const char  **sources;
     const char   *output;
@@ -173,20 +173,20 @@ struct Target {
     bool          use_xflags;
     bool          is_default;
     NobexWatch    watch;
-    bool        (*run)(Target*, NobexContext*);
+    bool        (*run)(NobexTarget*, NobexContext*);
     bool        (*phony)(NobexContext*);
-    void        (*on_before_build)(Target*, NobexContext*);
-    void        (*on_after_build)(Target*,  NobexContext*);
-    void        (*on_error)(Target*,        NobexContext*);
+    void        (*on_before_build)(NobexTarget*, NobexContext*);
+    void        (*on_after_build)(NobexTarget*,  NobexContext*);
+    void        (*on_error)(NobexTarget*,        NobexContext*);
 };
 
 struct NobexGraph {
-    Target **items;
+    NobexTarget **items;
     size_t   count;
     size_t   capacity;
 };
 
-typedef struct { Target **items; size_t count; size_t capacity; } _NobexDoneSet;
+typedef struct { NobexTarget **items; size_t count; size_t capacity; } _NobexDoneSet;
 
 struct NobexContext {
     NobexGraph         *graph;
@@ -212,21 +212,21 @@ struct NobexContext {
  * The parameter is named FN (not `name`) to avoid the macro argument
  * being substituted inside the `.name` struct field designator. */
 #define NOB_ARTIFACT(FN, ...)                                                \
-    static Target _nobex_target_##FN = { .name = #FN, __VA_ARGS__ };        \
-    static Target *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
+    static NobexTarget _nobex_target_##FN = { .name = #FN, __VA_ARGS__ };        \
+    static NobexTarget *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
 
 #define NOB_RULE(FN, ...)                                                    \
-    static Target _nobex_target_##FN = {                                     \
+    static NobexTarget _nobex_target_##FN = {                                     \
         .name = #FN, .type = TARGET_RULE, __VA_ARGS__                       \
     };                                                                       \
-    static Target *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
+    static NobexTarget *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
 
 #define NOB_PHONY(FN, ...)                                                   \
-    static Target _nobex_target_##FN = {                                     \
+    static NobexTarget _nobex_target_##FN = {                                     \
         .name = #FN, .type = TARGET_PHONY,                                  \
         .phony = FN, __VA_ARGS__                                             \
     };                                                                       \
-    static Target *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
+    static NobexTarget *_nobex_ptr_##FN NOBEX_SECTION = &_nobex_target_##FN
 
 /* =========================================================
  * G — Helper macros
@@ -247,7 +247,7 @@ void        nobex_set(NobexContext *ctx, const char *key, const char *value);
 const char *nobex_get(NobexContext *ctx, const char *key);
 
 /* Graph helpers (usable inside hooks and phonies) */
-Target     *nobex_find(NobexContext *ctx, const char *name);
+NobexTarget     *nobex_find(NobexContext *ctx, const char *name);
 bool        nobex_run(NobexContext *ctx, const char *name);
 const char *nobex_output(NobexContext *ctx, const char *name);
 
@@ -272,13 +272,13 @@ extern const char *_nobex_default_group;
 /* ── Platform sentinels ── */
 
 #ifdef _WIN32
-__declspec(allocate("nob_tg$a")) Target *_nobex_win_begin = NULL;
-__declspec(allocate("nob_tg$z")) Target *_nobex_win_end   = NULL;
+__declspec(allocate("nob_tg$a")) NobexTarget *_nobex_win_begin = NULL;
+__declspec(allocate("nob_tg$z")) NobexTarget *_nobex_win_end   = NULL;
 #elif !defined(__APPLE__)
 /* ELF: a dummy entry ensures the section always exists so the linker
  * synthesizes __start_nbx_<hash> and __stop_nbx_<hash> even when no
  * targets are declared (e.g. NOBEX_CLI mode). */
-static Target * NOBEX__UNUSED _nobex_section_dummy NOBEX_SECTION = NULL;
+static NobexTarget * NOBEX__UNUSED _nobex_section_dummy NOBEX_SECTION = NULL;
 #endif
 
 #ifdef NOBEX_DEFAULT_GROUP
@@ -380,9 +380,9 @@ static NOBEX__UNUSED void _nobex_collect_targets(NobexGraph *g)
     /* On ELF/Mach-O the boundary symbols may not exist if no targets were
      * declared (empty section). Guard with a weak-reference trick: if
      * NOBEX_TARGETS_BEGIN == NOBEX_TARGETS_END the section is empty. */
-    Target **begin = NOBEX_TARGETS_BEGIN;
-    Target **end   = NOBEX_TARGETS_END;
-    for (Target **p = begin; p < end; p++) {
+    NobexTarget **begin = NOBEX_TARGETS_BEGIN;
+    NobexTarget **end   = NOBEX_TARGETS_END;
+    for (NobexTarget **p = begin; p < end; p++) {
         if (*p) nob_da_append(g, *p);
     }
 #else
@@ -392,7 +392,7 @@ static NOBEX__UNUSED void _nobex_collect_targets(NobexGraph *g)
 #endif
 }
 
-static NOBEX__UNUSED Target *_nobex_graph_find(NobexGraph *g, const char *name)
+static NOBEX__UNUSED NobexTarget *_nobex_graph_find(NobexGraph *g, const char *name)
 {
     for (size_t i = 0; i < g->count; i++) {
         if (strcmp(g->items[i]->name, name) == 0) return g->items[i];
@@ -400,14 +400,14 @@ static NOBEX__UNUSED Target *_nobex_graph_find(NobexGraph *g, const char *name)
     return NULL;
 }
 
-Target *nobex_find(NobexContext *ctx, const char *name)
+NobexTarget *nobex_find(NobexContext *ctx, const char *name)
 {
     return _nobex_graph_find(ctx->graph, name);
 }
 
 const char *nobex_output(NobexContext *ctx, const char *name)
 {
-    Target *t = _nobex_graph_find(ctx->graph, name);
+    NobexTarget *t = _nobex_graph_find(ctx->graph, name);
     return t ? t->output : NULL;
 }
 
@@ -423,11 +423,11 @@ static NOBEX__UNUSED void _nobex_validate_dfs(NobexGraph *g, size_t idx, _NobexV
     }
 
     state[idx] = NOBEX_IN_PROGRESS;
-    Target *t = g->items[idx];
+    NobexTarget *t = g->items[idx];
 
     if (t->deps) {
         for (size_t d = 0; t->deps[d]; d++) {
-            Target *dep = _nobex_graph_find(g, t->deps[d]);
+            NobexTarget *dep = _nobex_graph_find(g, t->deps[d]);
             if (!dep) {
                 nob_log(NOB_ERROR, "nobex: target '%s' depends on '%s' which does not exist",
                         t->name, t->deps[d]);
@@ -458,7 +458,7 @@ static NOBEX__UNUSED bool _nobex_validate_graph(NobexGraph *g)
     return ok;
 }
 
-static NOBEX__UNUSED bool _nobex_target_in_group(Target *t, const char *group)
+static NOBEX__UNUSED bool _nobex_target_in_group(NobexTarget *t, const char *group)
 {
     if (t->groups == NULL) {
         const char *dg = _nobex_default_group ? _nobex_default_group : "build";
@@ -524,7 +524,12 @@ static NOBEX__UNUSED const char *_nobex_expand(const char *s, NobexContext *ctx)
 
 static NOBEX__UNUSED bool _nobex_pkg_config(const char *pkg, bool want_cflags, Nob_String_Builder *out)
 {
+    
+    Nob_Log_Level saved = nob_minimal_log_level;
+    nob_minimal_log_level = NOB_WARNING;
     nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
+    nob_minimal_log_level = saved;
+
     const char *tmp = nob_temp_sprintf("%s/pkg_%s.tmp", NOBEX_CACHE_DIR, pkg);
     Nob_Cmd cmd = {0};
     nob_cmd_append(&cmd, "pkg-config", want_cflags ? "--cflags" : "--libs", pkg);
@@ -547,9 +552,9 @@ static NOBEX__UNUSED bool _nobex_pkg_config(const char *pkg, bool want_cflags, N
 
 /* ── Build engine ── */
 
-static NOBEX__UNUSED bool _nobex_target_build(Target *t, NobexContext *ctx);  /* forward */
+static NOBEX__UNUSED bool _nobex_target_build(NobexTarget *t, NobexContext *ctx);  /* forward */
 
-static NOBEX__UNUSED bool _nobex_needs_rebuild(Target *t, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_needs_rebuild(NobexTarget *t, NobexContext *ctx)
 {
     if (ctx->force) return true;
     if (!t->output) return true;
@@ -560,9 +565,13 @@ static NOBEX__UNUSED bool _nobex_needs_rebuild(Target *t, NobexContext *ctx)
     return r < 0 ? true : (bool)r;
 }
 
-static NOBEX__UNUSED bool _nobex_build_executable(Target *t, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *ctx)
 {
+    Nob_Log_Level saved = nob_minimal_log_level;
+    nob_minimal_log_level = NOB_WARNING;
     nob_mkdir_if_not_exists("build");
+    nob_minimal_log_level = saved;
+
     const char *output = t->output ? t->output : "a.out";
 
     /* compile each source to an object file */
@@ -652,7 +661,7 @@ static NOBEX__UNUSED bool _nobex_build_executable(Target *t, NobexContext *ctx)
     return true;
 }
 
-static NOBEX__UNUSED bool _nobex_build_static_lib(Target *t, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_build_static_lib(NobexTarget *t, NobexContext *ctx)
 {
     nob_mkdir_if_not_exists("build");
     const char *output = t->output ? t->output : "build/libout.a";
@@ -687,7 +696,7 @@ static NOBEX__UNUSED bool _nobex_build_static_lib(Target *t, NobexContext *ctx)
     return nob_cmd_run(&ar);
 }
 
-static NOBEX__UNUSED bool _nobex_build_shared_lib(Target *t, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_build_shared_lib(NobexTarget *t, NobexContext *ctx)
 {
     nob_mkdir_if_not_exists("build");
     const char *output = t->output ? t->output : "build/libout.so";
@@ -716,19 +725,19 @@ static NOBEX__UNUSED bool _nobex_build_shared_lib(Target *t, NobexContext *ctx)
     return nob_cmd_run(&cmd);
 }
 
-static bool _nobex_done_contains(NobexContext *ctx, Target *t)
+static bool _nobex_done_contains(NobexContext *ctx, NobexTarget *t)
 {
     for (size_t i = 0; i < ctx->done.count; i++)
         if (ctx->done.items[i] == t) return true;
     return false;
 }
 
-static void _nobex_done_mark(NobexContext *ctx, Target *t)
+static void _nobex_done_mark(NobexContext *ctx, NobexTarget *t)
 {
     nob_da_append(&ctx->done, t);
 }
 
-static NOBEX__UNUSED bool _nobex_target_build(Target *t, NobexContext *ctx)
+static NOBEX__UNUSED bool _nobex_target_build(NobexTarget *t, NobexContext *ctx)
 {
     /* non-phony targets are only built once per run */
     if (t->type != TARGET_PHONY && _nobex_done_contains(ctx, t)) return true;
@@ -736,7 +745,7 @@ static NOBEX__UNUSED bool _nobex_target_build(Target *t, NobexContext *ctx)
     /* post-order: run deps first */
     if (t->deps) {
         for (size_t i = 0; t->deps[i]; i++) {
-            Target *dep = _nobex_graph_find(ctx->graph, t->deps[i]);
+            NobexTarget *dep = _nobex_graph_find(ctx->graph, t->deps[i]);
             if (!dep) {
                 nob_log(NOB_ERROR, "nobex: dep '%s' not found", t->deps[i]);
                 return false;
@@ -801,7 +810,7 @@ static NOBEX__UNUSED bool _nobex_graph_run_serial(NobexGraph *g, NobexContext *c
  * Full DAG-aware scheduling (in-degree queue) is left for a future version. */
 #ifdef _WIN32
 
-typedef struct { Target *target; NobexContext *ctx; bool result; } _NobexWinArg;
+typedef struct { NobexTarget *target; NobexContext *ctx; bool result; } _NobexWinArg;
 
 static DWORD WINAPI _nobex_thread_win(LPVOID arg)
 {
@@ -834,7 +843,7 @@ static NOBEX__UNUSED bool _nobex_graph_run_parallel(NobexGraph *g, NobexContext 
 
 #else /* POSIX */
 
-typedef struct { Target *target; NobexContext *ctx; bool result; } _NobexPosixArg;
+typedef struct { NobexTarget *target; NobexContext *ctx; bool result; } _NobexPosixArg;
 
 static void *_nobex_thread_posix(void *arg)
 {
@@ -874,7 +883,7 @@ static NOBEX__UNUSED bool _nobex_graph_run(NobexGraph *g, NobexContext *ctx)
 
 bool nobex_run(NobexContext *ctx, const char *name)
 {
-    Target *t = _nobex_graph_find(ctx->graph, name);
+    NobexTarget *t = _nobex_graph_find(ctx->graph, name);
     if (!t) { nob_log(NOB_ERROR, "nobex: target '%s' not found", name); return false; }
     return _nobex_target_build(t, ctx);
 }
@@ -887,7 +896,7 @@ static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_g
     const char *seen[256]; size_t n = 0;
 
     for (size_t i = 0; i < g->count; i++) {
-        Target *t = g->items[i];
+        NobexTarget *t = g->items[i];
         const char *_dg = _nobex_default_group ? _nobex_default_group : "build";
         const char *_dg_arr[2] = { _dg, NULL };
         const char **gs = t->groups ? t->groups : _dg_arr;
@@ -915,7 +924,7 @@ static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_g
 
     printf("\nTargets:\n");
     for (size_t i = 0; i < g->count; i++) {
-        Target *t = g->items[i];
+        NobexTarget *t = g->items[i];
         const char *ts = "Executable";
         switch (t->type) {
             case TARGET_STATIC_LIB: ts = "Static lib"; break;
@@ -944,7 +953,7 @@ static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_g
 static NOBEX__UNUSED void _nobex_print_list(NobexGraph *g)
 {
     for (size_t i = 0; i < g->count; i++) {
-        Target *t = g->items[i];
+        NobexTarget *t = g->items[i];
         printf("%s", t->name);
         if (t->groups) {
             printf("  [");
@@ -996,7 +1005,7 @@ static NOBEX__UNUSED bool _nobex_watch_loop(NobexGraph *subgraph, NobexContext *
     size_t nfiles = 0, fcap = 0;
 
     for (size_t i = 0; i < subgraph->count; i++) {
-        Target *t = subgraph->items[i];
+        NobexTarget *t = subgraph->items[i];
         if (t->watch.skip || !t->sources) continue;
         for (size_t j = 0; t->sources[j]; j++) {
             if (nfiles >= fcap) {
@@ -1026,14 +1035,14 @@ static NOBEX__UNUSED bool _nobex_watch_loop(NobexGraph *subgraph, NobexContext *
             nanosleep(&ts, NULL);
 
             for (size_t i = 0; i < subgraph->count; i++) {
-                Target *t = subgraph->items[i];
+                NobexTarget *t = subgraph->items[i];
                 if (!t->watch.skip && t->watch.on_change) t->watch.on_change(t, ctx);
             }
 
             bool ok = _nobex_graph_run(subgraph, ctx);
 
             for (size_t i = 0; i < subgraph->count; i++) {
-                Target *t = subgraph->items[i];
+                NobexTarget *t = subgraph->items[i];
                 if (t->watch.skip) continue;
                 if ( ok && t->watch.on_built) t->watch.on_built(t, ctx);
                 if (!ok && t->watch.on_error) t->watch.on_error(t, ctx);
@@ -1104,6 +1113,7 @@ static NOBEX__UNUSED int _nobex_parse_jobs(const char *s)
 
 #if defined(NOBEX_IMPLEMENTATION) && !defined(NOBEX_NO_MAIN)
 
+
 int main(int argc, char **argv)
 {
     _nobex_self_rebuild(argc, argv);
@@ -1159,7 +1169,10 @@ int main(int argc, char **argv)
                           .jobs = jobs, .dry_run = dry_run, .verbose = verbose,
                           .force = force };
 
+    Nob_Log_Level saved = nob_minimal_log_level;
+    nob_minimal_log_level = NOB_WARNING;
     nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
+    nob_minimal_log_level = saved;
 
     if (watch) return _nobex_watch_loop(&subgraph, &ctx) ? 0 : 1;
     return _nobex_graph_run(&subgraph, &ctx) ? 0 : 1;
@@ -1195,8 +1208,11 @@ static NOBEX__UNUSED void _nobex_cli_exec(const char *binary, int argc, char **a
 #endif
 }
 
+
 int main(int argc, char **argv)
 {
+
+
     nob_shift(argv, argc); /* consume program name */
 
     const char *source = NULL;

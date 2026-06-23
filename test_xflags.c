@@ -169,8 +169,7 @@ static void test_store(void)
     printf("\n[NobexStore — set/get/overwrite]\n");
 
     NobexStore   store = {0};
-    NobexGraph   g     = {0};
-    NobexContext ctx   = { .graph = &g, .store = &store };
+    NobexContext ctx   = { .store = &store };
 
     nobex_set(&ctx, "cc.flags", "-O2");
     CHECK_STR("get after first set",          nobex_get(&ctx, "cc.flags"), "-O2");
