@@ -40,7 +40,6 @@ NOB_ARTIFACT(myapp,
     .sources    = SRCS("main.c"),
     .output     = "myapp",
     .type       = TARGET_EXECUTABLE,
-    .is_default = true,
 );
 ```
 
@@ -70,14 +69,15 @@ NOB_ARTIFACT(mylib,
 );
 
 NOB_ARTIFACT(myapp,
-    .sources    = SRCS("main.c"),
-    .output     = "myapp",
-    .type       = TARGET_EXECUTABLE,
-    .deps       = DEPS("mylib"),
-    .cflags     = FLAGS("-Isrc", "-O2"),
-    .lflags     = FLAGS("-lm"),
-    .is_default = true,
-    .groups     = GROUPS("build", "ci"),
+    .sources      = SRCS("main.c"),
+    .inputs       = SRCS("include/mylib.h", "include/config.h"),
+    .output       = "myapp",
+    .type         = TARGET_EXECUTABLE,
+    .deps         = DEPS("mylib"),
+    .cflags       = FLAGS("-Isrc", "-O2"),
+    .lflags       = FLAGS("-lm"),
+    .groups       = GROUPS("build", "ci"),
+    .description  = "main application binary",
 );
 ```
 
@@ -89,10 +89,19 @@ NOB_ARTIFACT(myapp,
 | `TARGET_STATIC_LIB` | `cc cflags -c src... -o output.o` | `ar rcs output output.o` |
 | `TARGET_SHARED_LIB` | — | `cc -shared cflags src... -o output lflags` |
 
+`.inputs` lists files that participate in the mtime check but are not compiled individually — headers, generated files, scripts, or any other dependency. If any input is newer than the output, the target rebuilds.
+
+```c
+NOB_ARTIFACT(myapp,
+    .sources = SRCS("main.c"),
+    .inputs  = SRCS("include/api.h", "include/config.h"),
+    .output  = "myapp",
+);
+```
 
 ### `NOB_RULE`
 
-Like `NOB_ARTIFACT` but you supply the build function. Still checks mtime via `.sources` and `.output`.
+Like `NOB_ARTIFACT` but you supply the build function. Still checks mtime via `.sources`, `.inputs` and `.output`.
 
 ```c
 bool compile_shaders(Target *t, NobexContext *ctx)
@@ -120,7 +129,7 @@ bool clean(NobexContext *ctx)
     return true;
 }
 
-NOB_PHONY(clean);
+NOB_PHONY(clean, .description = "remove build artifacts");
 
 bool run(NobexContext *ctx)
 {
@@ -129,7 +138,7 @@ bool run(NobexContext *ctx)
     return nob_cmd_run(&cmd);
 }
 
-NOB_PHONY(run, .deps = DEPS("myapp"));
+NOB_PHONY(run, .deps = DEPS("myapp"), .description = "start the server on port 8080");
 ```
 
 `.deps` listed on a phony are built before the function is called.
@@ -139,11 +148,13 @@ NOB_PHONY(run, .deps = DEPS("myapp"));
 ## Helper macros
 
 ```c
-SRCS(...)    // NULL-terminated array of source paths
-DEPS(...)    // NULL-terminated array of target names
-FLAGS(...)   // NULL-terminated array of flags
-PKGS(...)    // NULL-terminated array of pkg-config package names
-GROUPS(...)  // NULL-terminated array of group names
+LIST(...)    // NULL-terminated array — base macro for all the aliases below
+SRCS(...)    // source paths
+DEPS(...)    // target names
+FLAGS(...)   // compiler/linker flags
+PKGS(...)    // pkg-config package names
+GROUPS(...)  // group names
+INPUTS(...)  // file dependencies (headers, generated files) checked for mtime but not compiled
 ```
 
 ---
@@ -166,7 +177,6 @@ NOB_ARTIFACT(myapp,
     .sources    = SRCS("main.c"),
     .output     = "myapp",
     .groups     = GROUPS("build", "ci"),
-    .is_default = true,
 );
 ```
 
@@ -333,13 +343,14 @@ Targets with no dependency relationship run concurrently. A failing target cance
 
 | Flag | Description |
 |---|---|
-| `[group...]` | One or more groups to build; uses `NOBEX_DEFAULT_GROUP` if omitted |
+| `target` | Build a named target directly, in the order given |
+| `@group` | Build all targets in a group, in graph order |
 | `-j<N>` | Run up to N targets in parallel |
 | `--watch` | Watch mode on the specified group(s) |
 | `-B` | Force rebuild of all targets, ignoring mtimes |
 | `--dry-run` | Print commands without executing |
 | `--verbose`, `-v` | Print each command before executing |
-| `--list`, `-l` | Print all targets and their groups, then exit |
+| `--list`, `-l` | Print all targets, their groups, and descriptions, then exit |
 | `--help`, `-h` | Print groups and targets with descriptions, then exit |
 
 ---
@@ -486,23 +497,24 @@ NOB_ARTIFACT(myapp,
     .cflags         = FLAGS("-Isrc", "-Ibuild"),
     .lflags         = FLAGS("-Lbuild", "-lcore"),
     .groups         = GROUPS("build", "ci"),
-    .is_default     = true,
+    .description    = "main application binary",
     .on_after_build = after_deploy,
 );
 
 NOB_ARTIFACT(tests,
-    .sources = SRCS("tests/test_core.c"),
-    .output  = "tests/test_core",
-    .type    = TARGET_EXECUTABLE,
-    .deps    = DEPS("core"),
-    .cflags  = FLAGS("-Isrc"),
-    .lflags  = FLAGS("-Lbuild", "-lcore"),
-    .groups  = GROUPS("test"),
+    .sources     = SRCS("tests/test_core.c"),
+    .output      = "tests/test_core",
+    .type        = TARGET_EXECUTABLE,
+    .deps        = DEPS("core"),
+    .cflags      = FLAGS("-Isrc"),
+    .lflags      = FLAGS("-Lbuild", "-lcore"),
+    .groups      = GROUPS("test"),
+    .description = "core unit tests",
 );
 
-NOB_PHONY(clean);
-NOB_PHONY(install, .deps = DEPS("myapp"));
-NOB_PHONY(run_tests, .groups = GROUPS("test"));
+NOB_PHONY(clean,     .description = "remove build artifacts");
+NOB_PHONY(install,   .deps = DEPS("myapp"), .description = "install myapp to /usr/local/bin");
+NOB_PHONY(run_tests, .groups = GROUPS("test"), .description = "build and run tests");
 ```
 
 ```sh
