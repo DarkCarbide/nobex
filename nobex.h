@@ -814,9 +814,14 @@ static NOBEX__UNUSED bool _nobex_compile_sources(
 
 static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *ctx)
 {
+    const char *out_dir = "build";
+    if (t->output) {
+        const char *sl = strrchr(t->output, '/');
+        if (sl) out_dir = nob_temp_sprintf("%.*s", (int)(sl - t->output), t->output);
+    }
     Nob_Log_Level saved = nob_minimal_log_level;
     nob_minimal_log_level = NOB_WARNING;
-    nob_mkdir_if_not_exists("build");
+    nob_mkdir_if_not_exists(out_dir);
     nob_minimal_log_level = saved;
 
     void (*do_compile)(NobexCompileCtx*) = t->pipeline.compile ? t->pipeline.compile : _nobex_default_compile;
@@ -836,13 +841,20 @@ static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *
     for (size_t j = 0; j < nlf; j++) exp_lflags[j] = _nobex_expand(t->lflags[j], ctx);
     exp_lflags[nlf] = NULL;
 
+    /* derive obj dir from output path (same directory as the output file) */
+    const char *obj_dir = "build";
+    if (t->output) {
+        const char *slash = strrchr(t->output, '/');
+        if (slash) obj_dir = nob_temp_sprintf("%.*s", (int)(slash - t->output), t->output);
+    }
+
     /* collect obj paths */
     size_t nsrc = 0;
     if (t->sources) while (t->sources[nsrc]) nsrc++;
     const char **objs = (const char **)NOB_REALLOC(NULL, (nsrc + 1) * sizeof(char *));
     for (size_t i = 0; i < nsrc; i++) {
         const char *base = nob_path_name(t->sources[i]);
-        objs[i] = nob_temp_sprintf("build/%s.o", base);
+        objs[i] = nob_temp_sprintf("%s/%s.o", obj_dir, base);
     }
     objs[nsrc] = NULL;
 
@@ -902,7 +914,12 @@ static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *
 
 static NOBEX__UNUSED bool _nobex_build_static_lib(NobexTarget *t, NobexContext *ctx)
 {
-    nob_mkdir_if_not_exists("build");
+    const char *out_dir = "build";
+    if (t->output) {
+        const char *sl = strrchr(t->output, '/');
+        if (sl) out_dir = nob_temp_sprintf("%.*s", (int)(sl - t->output), t->output);
+    }
+    nob_mkdir_if_not_exists(out_dir);
     const char *output = t->output ? t->output : "build/libout.a";
 
     void (*do_compile)(NobexCompileCtx*) = t->pipeline.compile ? t->pipeline.compile : _nobex_default_compile;
@@ -914,13 +931,20 @@ static NOBEX__UNUSED bool _nobex_build_static_lib(NobexTarget *t, NobexContext *
     for (size_t j = 0; j < ncf; j++) exp_cflags[j] = _nobex_expand(t->cflags[j], ctx);
     exp_cflags[ncf] = NULL;
 
+    /* derive obj dir from output path */
+    const char *obj_dir = "build";
+    if (t->output) {
+        const char *slash = strrchr(t->output, '/');
+        if (slash) obj_dir = nob_temp_sprintf("%.*s", (int)(slash - t->output), t->output);
+    }
+
     /* collect obj paths */
     size_t nsrc = 0;
     if (t->sources) while (t->sources[nsrc]) nsrc++;
     const char **objs = (const char **)NOB_REALLOC(NULL, (nsrc + 1) * sizeof(char *));
     for (size_t i = 0; i < nsrc; i++) {
         const char *base = nob_path_name(t->sources[i]);
-        objs[i] = nob_temp_sprintf("build/%s.o", base);
+        objs[i] = nob_temp_sprintf("%s/%s.o", obj_dir, base);
     }
     objs[nsrc] = NULL;
 
