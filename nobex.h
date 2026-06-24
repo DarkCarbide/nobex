@@ -20,6 +20,19 @@
 #ifndef NOBEX_H_
 #define NOBEX_H_
 
+/* nobex version — used by --install-nobex to fetch this exact release.
+ * URL: https://raw.githubusercontent.com/DarkCarbide/nobex/v<NOBEX_VERSION>/nobex.h */
+#define NOBEX_VERSION "0.1.0"
+#define NOBEX_REPO    "https://raw.githubusercontent.com/DarkCarbide/nobex"
+
+/* GitHub commit hash, version, and SHA256 of the nob.h this nobex.h was built against.
+ * Used by `nobex --install-nob` to fetch and verify the exact matching nob.h:
+ *   https://raw.githubusercontent.com/tsoding/nob.h/<NOB_DEPENDENCY_HASH>/nob.h */
+#define NOB_DEPENDENCY_VERSION "3.8.2"
+#define NOB_DEPENDENCY_HASH    "d22059e636e071db6b8e80a1e17a87178ea060ba"
+#define NOB_DEPENDENCY_SHA256  "fe09502a0b228e990edcdd8e6181618840c13ff1a11befe58ef03459aa1edb64"
+#define NOB_REPO               "https://raw.githubusercontent.com/tsoding/nob.h"
+
 #if defined(NOBEX_IMPLEMENTATION) && defined(NOBEX_CLI)
 #  error "NOBEX_IMPLEMENTATION and NOBEX_CLI are mutually exclusive"
 #endif
@@ -1633,10 +1646,103 @@ int main(int argc, char **argv)
 
     nob_shift(argv, argc); /* consume program name */
 
-    /* intercept --version before forwarding to the build script */
+    /* intercept --version / --install-nob / --upgrade-nob before forwarding */
     for (int _i = 0; _i < argc; _i++) {
-        if (strcmp(argv[_i], "--version") == 0 || strcmp(argv[_i], "-V") == 0) {
+        const char *_a = argv[_i];
+        if (strcmp(_a, "--version") == 0 || strcmp(_a, "-V") == 0) {
             printf("nobex built %s %s\n", __DATE__, __TIME__);
+            return 0;
+        }
+        if (strcmp(_a, "--install-nob") == 0 || strcmp(_a, "--upgrade-nob") == 0) {
+            bool upgrade = strcmp(_a, "--upgrade-nob") == 0;
+
+            /* destination: next arg or current directory */
+            const char *dest_dir = ".";
+            if (_i + 1 < argc && argv[_i + 1][0] != '-')
+                dest_dir = argv[++_i];
+
+            const char *url;
+            if (upgrade) {
+                /* latest: fetch from the default branch */
+                url = "https://raw.githubusercontent.com/tsoding/nob.h/master/nob.h";
+                nob_log(NOB_INFO, "nobex: downloading latest nob.h -> %s/nob.h", dest_dir);
+            } else {
+                /* pinned: use the hash this nobex.h was built against */
+                url = "https://raw.githubusercontent.com/tsoding/nob.h/"
+                      NOB_DEPENDENCY_HASH "/nob.h";
+                nob_log(NOB_INFO, "nobex: downloading nob.h v" NOB_DEPENDENCY_VERSION
+                        " (%.*s) -> %s/nob.h",
+                        8, NOB_DEPENDENCY_HASH, dest_dir);
+            }
+
+            const char *out_path = nob_temp_sprintf("%s/nob.h", dest_dir);
+            Nob_Cmd _dl = {0};
+            nob_cmd_append(&_dl, "curl", "-fsSL", "-o", out_path, url);
+            if (!nob_cmd_run(&_dl)) {
+                nob_log(NOB_ERROR, "nobex: download failed");
+                return 1;
+            }
+
+            if (!upgrade) {
+                /* verify SHA256 of the downloaded file */
+                const char *sha_file = nob_temp_sprintf("%s/nob.h.sha256", NOBEX_CACHE_DIR);
+                Nob_Log_Level _sv = nob_minimal_log_level;
+                nob_minimal_log_level = NOB_ERROR;
+                nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
+                nob_minimal_log_level = _sv;
+
+                Nob_Cmd _sha = {0};
+                nob_cmd_append(&_sha, "sha256sum", out_path);
+                bool sha_ok = nob_cmd_run_opt(&_sha,
+                    (Nob_Cmd_Opt){ .stdout_path = sha_file });
+                if (sha_ok) {
+                    Nob_String_Builder _sb = {0};
+                    if (nob_read_entire_file(sha_file, &_sb)) {
+                        nob_sb_append_null(&_sb);
+                        /* sha256sum output: "<hash>  filename" */
+                        char *_sp = strchr(_sb.items, ' ');
+                        if (_sp) *_sp = '\0';
+                        if (strcmp(_sb.items, NOB_DEPENDENCY_SHA256) == 0) {
+                            nob_log(NOB_INFO, "nobex: SHA256 verified OK");
+                        } else {
+                            nob_log(NOB_WARNING,
+                                "nobex: SHA256 mismatch — expected %s, got %s",
+                                NOB_DEPENDENCY_SHA256, _sb.items);
+                        }
+                    }
+                    NOB_FREE(_sb.items);
+                }
+                remove(sha_file);
+            }
+
+            nob_log(NOB_INFO, "nobex: nob.h installed at %s", out_path);
+            return 0;
+        }
+        if (strcmp(_a, "--install-nobex") == 0 || strcmp(_a, "--upgrade-nobex") == 0) {
+            bool upgrade = strcmp(_a, "--upgrade-nobex") == 0;
+
+            const char *dest_dir = ".";
+            if (_i + 1 < argc && argv[_i + 1][0] != '-')
+                dest_dir = argv[++_i];
+
+            const char *url;
+            if (upgrade) {
+                url = NOBEX_REPO "/master/nobex.h";
+                nob_log(NOB_INFO, "nobex: downloading latest nobex.h -> %s/nobex.h", dest_dir);
+            } else {
+                url = NOBEX_REPO "/v" NOBEX_VERSION "/nobex.h";
+                nob_log(NOB_INFO, "nobex: downloading nobex.h v" NOBEX_VERSION
+                        " -> %s/nobex.h", dest_dir);
+            }
+
+            const char *out_path = nob_temp_sprintf("%s/nobex.h", dest_dir);
+            Nob_Cmd _dl = {0};
+            nob_cmd_append(&_dl, "curl", "-fsSL", "-o", out_path, url);
+            if (!nob_cmd_run(&_dl)) {
+                nob_log(NOB_ERROR, "nobex: download failed");
+                return 1;
+            }
+            nob_log(NOB_INFO, "nobex: nobex.h installed at %s", out_path);
             return 0;
         }
     }
