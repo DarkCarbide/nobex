@@ -749,9 +749,8 @@ extern const NobexPipeline nobex_pipeline_gpp;
 #endif
 
 /* ── Parallel compile helper ─────────────────────────────────────────────────
- * Compiles all sources that need rebuilding, up to ctx->jobs at a time.
- * On POSIX: fork()+waitpid() pool. On Windows: falls back to serial.
- * Returns false if any compilation fails.
+ * Compiles all sources that need rebuilding, up to ctx->jobs at a time,
+ * using nob's nob_cmd_run_async + nob_procs_append_with_flush primitives.
  * objs[] must already be filled (nsrc entries + NULL sentinel).
  * exp_cflags[] must already be expanded.
  * --------------------------------------------------------------------------- */
@@ -764,120 +763,20 @@ static NOBEX__UNUSED bool _nobex_compile_sources(
     size_t ninp = 0;
     if (t->inputs) while (t->inputs[ninp]) ninp++;
 
-#ifndef _WIN32
-    int jobs = ctx->jobs > 1 ? ctx->jobs : 1;
-    /* pids[i] == -1  → slot free
-     * pids[i] == 0   → source i does not need rebuild
-     * pids[i] >  0   → child pid compiling source i */
-    pid_t  *pids    = (pid_t  *)NOB_REALLOC(NULL, nsrc * sizeof(pid_t));
-    bool   *needed  = (bool   *)NOB_REALLOC(NULL, nsrc * sizeof(bool));
-    bool    ok      = true;
-    int     running = 0;
+    int    jobs  = ctx->jobs > 1 ? ctx->jobs : 1;
+    Nob_Procs procs = {0};
+    bool ok = true;
 
-    /* determine which sources need rebuilding */
-    for (size_t i = 0; i < nsrc; i++) {
-        pids[i] = -1;
+    for (size_t i = 0; i < nsrc && ok; i++) {
         const char *src = t->sources[i];
         const char *obj = objs[i];
+
         const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
         chk[0] = src;
         for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
         int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
         NOB_FREE(chk);
-        if (needs < 0) { NOB_FREE(pids); NOB_FREE(needed); return false; }
-        needed[i] = (needs || !nob_file_exists(obj));
-    }
-
-    size_t next = 0; /* next source index to dispatch */
-    while (ok && (running > 0 || next < nsrc)) {
-        /* fill available slots */
-        while (running < jobs && next < nsrc) {
-            if (!needed[next]) { next++; continue; }
-            const char *src = t->sources[next];
-            const char *obj = objs[next];
-            size_t extra = 0;
-            const char *xf = t->use_xflags ? nobex_xflags_get(src, "cflags") : NULL;
-            if (xf) extra = 1;
-            const char **src_cflags = (const char **)NOB_REALLOC(NULL, (ncf + extra + 1) * sizeof(char *));
-            for (size_t j = 0; j < ncf; j++) src_cflags[j] = exp_cflags[j];
-            if (xf) src_cflags[ncf] = xf;
-            src_cflags[ncf + extra] = NULL;
-
-            Nob_Cmd cmd = {0};
-            NobexCompileCtx pctx = { t, ctx, src, obj, src_cflags, &cmd };
-            do_compile(&pctx);
-            NOB_FREE(src_cflags);
-
-            if (ctx->dry_run) {
-                Nob_String_Builder sb = {0};
-                nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
-                printf("[dry-run] %s\n", sb.items);
-                NOB_FREE(sb.items); NOB_FREE(cmd.items);
-                pids[next] = -1;
-            } else {
-                /* log the command like nob does before forking */
-                {
-                    Nob_String_Builder sb = {0};
-                    nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
-                    nob_log(NOB_INFO, "CMD: %s", sb.items);
-                    NOB_FREE(sb.items);
-                }
-                pid_t pid = fork();
-                if (pid < 0) {
-                    nob_log(NOB_ERROR, "fork: %s", strerror(errno));
-                    NOB_FREE(cmd.items); ok = false; break;
-                }
-                if (pid == 0) {
-                    /* child: exec the command */
-                    const char **args = (const char **)NOB_REALLOC(NULL, (cmd.count + 1) * sizeof(char *));
-                    for (size_t k = 0; k < cmd.count; k++) args[k] = cmd.items[k];
-                    args[cmd.count] = NULL;
-                    execvp(args[0], (char *const *)args);
-                    fprintf(stderr, "execvp %s: %s\n", args[0], strerror(errno));
-                    exit(1);
-                }
-                NOB_FREE(cmd.items);
-                pids[next] = pid;
-                running++;
-            }
-            next++;
-        }
-
-        if (running == 0) break;
-
-        /* wait for any one child */
-        int status;
-        pid_t done = waitpid(-1, &status, 0);
-        if (done < 0) { nob_log(NOB_ERROR, "waitpid: %s", strerror(errno)); ok = false; break; }
-        running--;
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            nob_log(NOB_ERROR, "nobex: compilation failed (pid %d)", (int)done);
-            ok = false;
-        }
-        /* mark that slot free */
-        for (size_t i = 0; i < nsrc; i++) if (pids[i] == done) { pids[i] = -1; break; }
-    }
-
-    /* drain remaining children on failure */
-    if (!ok) {
-        int status;
-        while (running-- > 0) waitpid(-1, &status, 0);
-    }
-
-    NOB_FREE(pids); NOB_FREE(needed);
-    return ok;
-
-#else
-    /* Windows fallback: serial */
-    for (size_t i = 0; i < nsrc; i++) {
-        const char *src = t->sources[i];
-        const char *obj = objs[i];
-        const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
-        chk[0] = src;
-        for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
-        int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
-        NOB_FREE(chk);
-        if (needs < 0) return false;
+        if (needs < 0) { ok = false; break; }
         if (!needs && nob_file_exists(obj)) continue;
 
         size_t extra = 0;
@@ -899,13 +798,18 @@ static NOBEX__UNUSED bool _nobex_compile_sources(
             printf("[dry-run] %s\n", sb.items);
             NOB_FREE(sb.items); NOB_FREE(cmd.items);
         } else {
-            bool r = nob_cmd_run(&cmd);
-            NOB_FREE(cmd.items);
-            if (!r) return false;
+            Nob_Proc proc = nob_cmd_run_async_and_reset(&cmd);
+            if (proc == NOB_INVALID_PROC) { ok = false; break; }
+            ok = nob_procs_append_with_flush(&procs, proc, (size_t)jobs);
         }
     }
-    return true;
-#endif
+
+    /* wait for remaining in-flight compilations */
+    if (ok) ok = nob_procs_flush(&procs);
+    else         nob_procs_flush(&procs); /* drain to avoid zombies */
+
+    NOB_FREE(procs.items);
+    return ok;
 }
 
 static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *ctx)
