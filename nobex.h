@@ -1661,19 +1661,109 @@ int main(int argc, char **argv)
     nob_mkdir_if_not_exists(NOBEX_CACHE_DIR);
     nob_minimal_log_level = _cli_saved;
 
-    const char *base   = nob_temp_file_name(source);
-    const char *dot    = strrchr(base, '.');
-    const char *stem   = dot ? nob_temp_sprintf("%.*s", (int)(dot - base), base) : base;
-    const char *binary = nob_temp_sprintf("%s/%s", NOBEX_CACHE_DIR, stem);
+    const char *base      = nob_temp_file_name(source);
+    const char *dot       = strrchr(base, '.');
+    const char *stem      = dot ? nob_temp_sprintf("%.*s", (int)(dot - base), base) : base;
+    const char *binary    = nob_temp_sprintf("%s/%s",        NOBEX_CACHE_DIR, stem);
+    const char *dep_file  = nob_temp_sprintf("%s/%s.d",      NOBEX_CACHE_DIR, stem);
+    const char *err_file  = nob_temp_sprintf("%s/%s.stderr", NOBEX_CACHE_DIR, stem);
 
-    int needs = nob_needs_rebuild1(binary, source);
-    if (needs < 0) return 1;
+    const char *extra_c = nobex_xflags_get(source, "cflags");
+    const char *extra_l = nobex_xflags_get(source, "lflags");
 
-    if (needs || !nob_file_exists(binary)) {
+    /* ── dependency scan via -MM ────────────────────────────────────────────
+     * Generates CACHE_DIR/build.d listing every header the source includes.
+     * Used both for richer cache invalidation and to detect missing headers
+     * before attempting a full compile.
+     * ─────────────────────────────────────────────────────────────────────── */
+    {
+        Nob_Cmd mm = {0};
+        nob_cc(&mm);
+        nob_cmd_append(&mm, "-MM", "-MF", dep_file, source);
+        if (extra_c) nob_cmd_append(&mm, extra_c);
+
+        Nob_Log_Level _mm_saved = nob_minimal_log_level;
+        nob_minimal_log_level = NOB_ERROR;
+        bool mm_ok = nob_cmd_run_opt(&mm, (Nob_Cmd_Opt){ .stderr_path = err_file });
+        nob_minimal_log_level = _mm_saved;
+        NOB_FREE(mm.items);
+
+        if (!mm_ok) {
+            /* read stderr and look for "No such file or directory" */
+            Nob_String_Builder sb = {0};
+            if (nob_read_entire_file(err_file, &sb)) {
+                nob_sb_append_null(&sb);
+                char *line = sb.items;
+                while (line && *line) {
+                    char *nl = strchr(line, '\n');
+                    if (nl) *nl = '\0';
+                    if (strstr(line, "No such file or directory")) {
+                        /* format: "file.c:N:M: fatal error: header.h: No such..." */
+                        /* extract the filename between the last two colons before "No such" */
+                        char *no_such = strstr(line, ": No such");
+                        if (no_such) {
+                            *no_such = '\0';
+                            char *fname = strrchr(line, ' ');
+                            if (!fname) fname = strrchr(line, ':');
+                            if (fname) fname++;
+                            else fname = line;
+                            nob_log(NOB_ERROR, "nobex: missing header '%s'", fname);
+                            if (strcmp(fname, "nob.h") == 0 || strcmp(fname, "nobex.h") == 0)
+                                nob_log(NOB_INFO, "hint: run 'nobex --upgrade' to install missing headers");
+                        } else {
+                            nob_log(NOB_ERROR, "%s", line);
+                        }
+                    }
+                    line = nl ? nl + 1 : NULL;
+                }
+            }
+            NOB_FREE(sb.items);
+            remove(err_file);
+            return 1;
+        }
+        remove(err_file);
+    }
+
+    /* ── cache invalidation using .d deps ───────────────────────────────────
+     * Parse the .d file to get all headers the source depends on, then check
+     * if any of them are newer than the compiled binary.
+     * ─────────────────────────────────────────────────────────────────────── */
+    int needs = 0;
+    if (!nob_file_exists(binary)) {
+        needs = 1;
+    } else if (nob_file_exists(dep_file)) {
+        Nob_String_Builder dsb = {0};
+        if (nob_read_entire_file(dep_file, &dsb)) {
+            nob_sb_append_null(&dsb);
+            /* .d format: "target: dep1 dep2 \\\n  dep3 ..."
+             * skip everything up to and including the first ':' */
+            char *p = strchr(dsb.items, ':');
+            if (p) p++;
+            while (p && *p && !needs) {
+                /* skip whitespace, backslash-newlines */
+                while (*p == ' ' || *p == '\t' || *p == '\n' ||
+                       (*p == '\\' && *(p+1) == '\n')) {
+                    if (*p == '\\') p++;
+                    p++;
+                }
+                if (!*p) break;
+                /* read one token (path, no spaces) */
+                char *tok = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\\') p++;
+                char saved = *p; *p = '\0';
+                if (nob_needs_rebuild1(binary, tok) > 0) needs = 1;
+                *p = saved;
+            }
+        }
+        NOB_FREE(dsb.items);
+    } else {
+        needs = nob_needs_rebuild1(binary, source);
+        if (needs < 0) return 1;
+    }
+
+    if (needs) {
         nob_log(NOB_INFO, "nobex: compiling %s -> %s", source, binary);
 
-        const char *extra_c = nobex_xflags_get(source, "cflags");
-        const char *extra_l = nobex_xflags_get(source, "lflags");
         Nob_Cmd cmd = {0};
         nob_cc(&cmd);
         nob_cmd_append(&cmd, source);
