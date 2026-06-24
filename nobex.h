@@ -1675,6 +1675,7 @@ int main(int argc, char **argv)
                         8, NOB_DEPENDENCY_HASH, dest_dir);
             }
 
+            nob_mkdir_if_not_exists(dest_dir);
             const char *out_path = nob_temp_sprintf("%s/nob.h", dest_dir);
             Nob_Cmd _dl = {0};
             nob_cmd_append(&_dl, "curl", "-fsSL", "-o", out_path, url);
@@ -1735,6 +1736,7 @@ int main(int argc, char **argv)
                         " -> %s/nobex.h", dest_dir);
             }
 
+            nob_mkdir_if_not_exists(dest_dir);
             const char *out_path = nob_temp_sprintf("%s/nobex.h", dest_dir);
             Nob_Cmd _dl = {0};
             nob_cmd_append(&_dl, "curl", "-fsSL", "-o", out_path, url);
@@ -1797,6 +1799,9 @@ int main(int argc, char **argv)
         if (!mm_ok) {
             /* read stderr and look for "No such file or directory" */
             Nob_String_Builder sb = {0};
+            bool missing_nob    = false;
+            bool missing_nobex  = false;
+            bool missing_hint   = false;
             if (nob_read_entire_file(err_file, &sb)) {
                 nob_sb_append_null(&sb);
                 char *line = sb.items;
@@ -1804,8 +1809,6 @@ int main(int argc, char **argv)
                     char *nl = strchr(line, '\n');
                     if (nl) *nl = '\0';
                     if (strstr(line, "No such file or directory")) {
-                        /* format: "file.c:N:M: fatal error: header.h: No such..." */
-                        /* extract the filename between the last two colons before "No such" */
                         char *no_such = strstr(line, ": No such");
                         if (no_such) {
                             *no_such = '\0';
@@ -1814,8 +1817,9 @@ int main(int argc, char **argv)
                             if (fname) fname++;
                             else fname = line;
                             nob_log(NOB_ERROR, "nobex: missing header '%s'", fname);
-                            if (strcmp(fname, "nob.h") == 0 || strcmp(fname, "nobex.h") == 0)
-                                nob_log(NOB_INFO, "hint: run 'nobex --upgrade' to install missing headers");
+                            if (strcmp(fname, "nob.h") == 0)    missing_nob   = true;
+                            if (strcmp(fname, "nobex.h") == 0)  missing_nobex = true;
+                            if (missing_nob || missing_nobex)   missing_hint  = true;
                         } else {
                             nob_log(NOB_ERROR, "%s", line);
                         }
@@ -1824,6 +1828,15 @@ int main(int argc, char **argv)
                 }
             }
             NOB_FREE(sb.items);
+            /* gcc -MM stops at first fatal error, so if nob.h is missing nobex.h
+             * will also be missing — report both and give a combined hint */
+            if (missing_nob && !missing_nobex) {
+                nob_log(NOB_ERROR, "nobex: missing header 'nobex.h' (implied by missing nob.h)");
+                missing_hint = true;
+            }
+            if (missing_hint) {
+                nob_log(NOB_INFO, "hint: run 'nobex --install-nob . && nobex --install-nobex .' to install missing headers");
+            }
             remove(err_file);
             return 1;
         }
