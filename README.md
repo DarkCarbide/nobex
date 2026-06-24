@@ -50,7 +50,7 @@ cc build.c -o build -lpthread
 ./build
 ```
 
-following then NOB_GO_REBUILD_YOURSELF, nobex recompiles `build.c` automatically when the source changes.
+nobex recompiles `build.c` automatically when the source changes.
 
 ---
 
@@ -70,7 +70,7 @@ NOB_ARTIFACT(mylib,
 
 NOB_ARTIFACT(myapp,
     .sources      = SRCS("main.c"),
-    .inputs       = SRCS("include/mylib.h", "include/config.h"),
+    .inputs       = INPUTS("include/mylib.h", "include/config.h"),
     .output       = "myapp",
     .type         = TARGET_EXECUTABLE,
     .deps         = DEPS("mylib"),
@@ -86,7 +86,7 @@ NOB_ARTIFACT(myapp,
 | Type | Compile step | Link step |
 |---|---|---|
 | `TARGET_EXECUTABLE` | `cc cflags -c src -o src.o` per source | `cc src.o... -o output lflags` |
-| `TARGET_STATIC_LIB` | `cc cflags -c src... -o output.o` | `ar rcs output output.o` |
+| `TARGET_STATIC_LIB` | `cc cflags -c src -o src.o` per source | `ar rcs output src.o...` |
 | `TARGET_SHARED_LIB` | — | `cc -shared cflags src... -o output lflags` |
 
 `.inputs` lists files that participate in the mtime check but are not compiled individually — headers, generated files, scripts, or any other dependency. If any input is newer than the output, the target rebuilds.
@@ -94,7 +94,7 @@ NOB_ARTIFACT(myapp,
 ```c
 NOB_ARTIFACT(myapp,
     .sources = SRCS("main.c"),
-    .inputs  = SRCS("include/api.h", "include/config.h"),
+    .inputs  = INPUTS("include/api.h", "include/config.h"),
     .output  = "myapp",
 );
 ```
@@ -104,7 +104,7 @@ NOB_ARTIFACT(myapp,
 Like `NOB_ARTIFACT` but you supply the build function. Still checks mtime via `.sources`, `.inputs` and `.output`.
 
 ```c
-bool compile_shaders(Target *t, NobexContext *ctx)
+bool compile_shaders(NobexTarget *t, NobexContext *ctx)
 {
     Nob_Cmd cmd = {0};
     nob_cmd_append(&cmd, "glslc", t->sources[0], "-o", t->output);
@@ -125,8 +125,7 @@ Declares a target with no output — always runs when invoked. Requires a matchi
 ```c
 bool clean(NobexContext *ctx)
 {
-    nob_delete_file("myapp");
-    return true;
+    return nobex_cleanup("build/*.o", "build/myapp");
 }
 
 NOB_PHONY(clean, .description = "remove build artifacts");
@@ -155,13 +154,14 @@ FLAGS(...)   // compiler/linker flags
 PKGS(...)    // pkg-config package names
 GROUPS(...)  // group names
 INPUTS(...)  // file dependencies (headers, generated files) checked for mtime but not compiled
+VARS(...)    // variable names consumed by this target, shown in --help
 ```
 
 ---
 
 ## Groups
 
-Targets belong to one or more groups. Pass a group name as a positional argument to build only that subset.
+Targets belong to one or more groups. Pass `@group` to build only that subset, or a bare name to build a specific target directly.
 
 ```c
 #define NOBEX_DEFAULT_GROUP "build"
@@ -174,17 +174,19 @@ NOB_ARTIFACT(docs,
 );
 
 NOB_ARTIFACT(myapp,
-    .sources    = SRCS("main.c"),
-    .output     = "myapp",
-    .groups     = GROUPS("build", "ci"),
+    .sources = SRCS("main.c"),
+    .output  = "myapp",
+    .groups  = GROUPS("build", "ci"),
 );
 ```
 
 ```sh
-./build          # runs the default group ("build")
-./build doc      # runs only the "doc" group
-./build ci       # runs only the "ci" group
-./build build doc  # runs both groups
+./build                # runs the default group
+./build @doc           # runs only the "doc" group
+./build @ci            # runs only the "ci" group
+./build @build @doc    # runs both groups in order
+./build myapp          # builds only the "myapp" target
+./build clean @build   # runs "clean" target, then the "build" group
 ```
 
 Targets without `.groups` automatically inherit the default group. If `NOBEX_DEFAULT_GROUP` is not defined, the fallback is `"build"`.
@@ -193,7 +195,52 @@ Targets without `.groups` automatically inherit the default group. If `NOBEX_DEF
 
 ## Store and `$(key)` expansion
 
-A `NOB_PHONY` can inject key-value pairs into the context store. Any `NOB_ARTIFACT` that lists the phony in `.deps` can consume those values via `$(key)` expansion in `.cflags` or `.lflags`.
+The store is a key-value map attached to the build context. Values can come from two sources: a `NOB_PHONY` that calls `nobex_set`, or variables passed directly on the CLI as `key=value`.
+
+### Variables from CLI
+
+Pass variables as `key=value` arguments anywhere in the command line:
+
+```sh
+./build install_dir=~/workspace/tools install
+```
+
+nobex expands `~` to the home directory automatically. The variable is injected into the store before any target runs, so phonies can read it with `nobex_get` and artifacts can reference it via `$(key)` in `.cflags` or `.lflags`.
+
+Targets declare which variables they consume with `.vars`. nobex warns about variables passed on the CLI that no scheduled target declares:
+
+```c
+bool install(NobexContext *ctx)
+{
+    const char *dest = nobex_get(ctx, "install_dir");
+    if (!dest) dest = "/usr/local/bin";
+    return nob_copy_file("build/myapp", nob_temp_sprintf("%s/myapp", dest));
+}
+
+NOB_PHONY(install,
+    .deps        = DEPS("myapp"),
+    .description = "install myapp",
+    .vars        = VARS("install_dir"),
+);
+```
+
+```sh
+./build install_dir=~/workspace/tools install   # installs to ~/workspace/tools
+./build install                                  # installs to /usr/local/bin (default)
+./build foo=bar install                          # WARNING: 'foo' is not used by any scheduled target
+```
+
+Variables appear in `--help` under their declaring target:
+
+```
+Targets:
+    install              Phony    install myapp
+      vars:  install_dir=<value>
+```
+
+### Variables from phonies
+
+A phony can also populate the store programmatically. Any artifact that lists the phony in `.deps` can consume those values via `$(key)` expansion in `.cflags` or `.lflags`:
 
 ```c
 bool deps(NobexContext *ctx)
@@ -270,22 +317,91 @@ void nobex_xflags_each(const char *filepath,
 
 ---
 
-## Lifecycle hooks
+## Pipeline — custom compile and link steps
 
-Targets support three hooks. Each receives the `Target` and the `NobexContext`.
+By default nobex uses `nob_cc()` for both compile and link. A `NobexPipeline` lets you replace either step per-target — useful for mixed-language projects or non-standard toolchains.
 
 ```c
-void on_before(Target *t, NobexContext *ctx)
+typedef struct {
+    void (*compile)(NobexCompileCtx *pctx);
+    void (*link)(NobexLinkCtx *pctx);
+} NobexPipeline;
+```
+
+The handler only populates `pctx->cmd` — nobex runs, prints, or discards the command depending on flags like `--dry-run`.
+
+```c
+void my_compile(NobexCompileCtx *pctx)
+{
+    nob_cmd_append(pctx->cmd, "g++");
+    if (pctx->cflags)
+        for (size_t i = 0; pctx->cflags[i]; i++)
+            nob_cmd_append(pctx->cmd, pctx->cflags[i]);
+    nob_cmd_append(pctx->cmd, "-c", pctx->src, "-o", pctx->obj);
+}
+
+NOB_ARTIFACT(engine,
+    .sources  = SRCS("src/engine.cpp"),
+    .output   = "build/engine",
+    .pipeline = { .compile = my_compile },  /* link step stays default */
+);
+```
+
+Built-in pipelines ready to use:
+
+| Pipeline | Compiler |
+|---|---|
+| `nobex_default_pipeline` | `nob_cc()` (follows nob.h compiler setting) |
+| `nobex_pipeline_gcc` | `gcc` |
+| `nobex_pipeline_clang` | `clang` |
+| `nobex_pipeline_gpp` | `g++` |
+
+```c
+NOB_ARTIFACT(imgui,
+    .sources  = SRCS("vendor/imgui/imgui.cpp", "vendor/imgui/imgui_draw.cpp"),
+    .output   = "build/imgui.a",
+    .type     = TARGET_STATIC_LIB,
+    .pipeline = nobex_pipeline_gpp,
+);
+```
+
+---
+
+## `nobex_cleanup` — glob-based file removal
+
+Deletes files matching one or more glob patterns. Useful in `clean` phonies.
+
+```c
+bool clean(NobexContext *ctx)
+{
+    return nobex_cleanup("build/*.o", "build/*.a", "build/myapp");
+}
+
+NOB_PHONY(clean, .groups = GROUPS("clean"));
+```
+
+The macro automatically appends the required `NULL` sentinel — no need to add it manually.
+
+On POSIX, uses `glob(3)`. On Windows, uses `FindFirstFile`/`FindNextFile`.
+
+---
+
+## Lifecycle hooks
+
+Targets support three hooks. Each receives the `NobexTarget` and the `NobexContext`.
+
+```c
+void on_before(NobexTarget *t, NobexContext *ctx)
 {
     // inject extra flags from the store, set up directories, etc.
 }
 
-void on_after(Target *t, NobexContext *ctx)
+void on_after(NobexTarget *t, NobexContext *ctx)
 {
     // deploy, sign, copy, send a notification
 }
 
-void on_error(Target *t, NobexContext *ctx)
+void on_error(NobexTarget *t, NobexContext *ctx)
 {
     // clean up partial output, notify
 }
@@ -299,15 +415,13 @@ NOB_ARTIFACT(myapp,
 );
 ```
 
-Hooks run regardless of whether `--watch` is active. To suppress them during watch, set `.watch.skip_hooks = true`.
-
 ---
 
 ## Watch mode
 
 ```sh
-./build --watch        # watches the default group
-./build --watch doc    # watches only the "doc" group
+./build --watch         # watches the default group
+./build --watch @doc    # watches only the "doc" group
 ```
 
 The watch loop polls mtime at `.watch.poll_ms` (default 50 ms) with a debounce of `.watch.debounce_ms` (default 100 ms). Set `.watch.skip = true` on a target to exclude it completely.
@@ -345,13 +459,15 @@ Targets with no dependency relationship run concurrently. A failing target cance
 |---|---|
 | `target` | Build a named target directly, in the order given |
 | `@group` | Build all targets in a group, in graph order |
+| `key=value` | Set a variable consumed by a target; `~` is expanded to home directory |
 | `-j<N>` | Run up to N targets in parallel |
 | `--watch` | Watch mode on the specified group(s) |
 | `-B` | Force rebuild of all targets, ignoring mtimes |
 | `--dry-run` | Print commands without executing |
 | `--verbose`, `-v` | Print each command before executing |
 | `--list`, `-l` | Print all targets, their groups, and descriptions, then exit |
-| `--help`, `-h` | Print groups and targets with descriptions, then exit |
+| `--help`, `-h` | Print help; if targets/groups are also given, shows detail only for those |
+| `--version`, `-V` | Print when the nobex CLI binary was compiled, then exit |
 
 ---
 
@@ -388,16 +504,19 @@ When you run `nobex` in a directory, it:
 
 1. Looks for `nob.c` or `build.c`
 2. Reads `cflags` and `lflags` xflags from that file to get compilation flags
-3. Compiles it to `.nobex/<filename>` and manages Recompilation if necessary
+3. Compiles it to `.nobex/<filename>` and manages recompilation if necessary
 4. Passes all remaining arguments to the build script
 
 ```sh
-nobex                  # auto-discovers build.c, compiles if needed, runs it
-nobex all              # passes "all" as a group argument
-nobex run build.c      # explicit source file
-nobex --watch doc
-nobex -j4 ci
+nobex                   # auto-discovers build.c, compiles if needed, runs it
+nobex @all              # runs the "all" group
+nobex run build.c       # explicit source file
+nobex --watch @doc
+nobex -j4 @ci
 nobex --list
+nobex --version         # shows when the nobex CLI binary itself was compiled
+nobex install --help    # shows help and details only for the "install" target
+nobex @ci --help        # shows help and details only for targets in the "ci" group
 ```
 
 ### Building the CLI with nobex itself
@@ -407,7 +526,8 @@ Once bootstrapped, `build.c` can declare nobex as a target so it rebuilds when `
 ```c
 NOB_ARTIFACT(nobex,
     .sources = SRCS("nobex.h"),
-    .output  = "nobex",
+    .inputs  = INPUTS("nob.h"),
+    .output  = "build/nobex",
     .type    = TARGET_EXECUTABLE,
     .cflags  = FLAGS("-x", "c", "-DNOBEX_CLI"),
     .lflags  = FLAGS("-lpthread"),
@@ -430,9 +550,11 @@ A project that builds a static library, links an executable against it, runs tes
 #define NOBEX_IMPLEMENTATION
 #include "nobex.h"
 
+#define BUILD_DIR "build"
+
 /* ── hooks ── */
 
-void after_deploy(Target *t, NobexContext *ctx)
+void after_deploy(NobexTarget *t, NobexContext *ctx)
 {
     (void)t; (void)ctx;
     nob_log(NOB_INFO, "deployed to /usr/local/bin");
@@ -440,7 +562,7 @@ void after_deploy(Target *t, NobexContext *ctx)
 
 /* ── rules ── */
 
-bool gen_version(Target *t, NobexContext *ctx)
+bool gen_version(NobexTarget *t, NobexContext *ctx)
 {
     (void)ctx;
     FILE *f = fopen(t->output, "w");
@@ -454,18 +576,14 @@ bool gen_version(Target *t, NobexContext *ctx)
 
 bool clean(NobexContext *ctx)
 {
-    (void)ctx;
-    nob_delete_file("myapp");
-    nob_delete_file("build/libcore.a");
-    nob_delete_file("build/version.h");
-    return true;
+    return nobex_cleanup(BUILD_DIR "/*.o", BUILD_DIR "/*.a", BUILD_DIR "/myapp");
 }
 
 bool run_tests(NobexContext *ctx)
 {
     if (!nobex_run(ctx, "tests")) return false;
     Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, "./tests");
+    nob_cmd_append(&cmd, BUILD_DIR "/tests");
     return nob_cmd_run(&cmd);
 }
 
@@ -478,24 +596,27 @@ bool install(NobexContext *ctx)
 
 NOB_RULE(version_h,
     .sources = SRCS("build.c"),
-    .output  = "build/version.h",
+    .output  = BUILD_DIR "/version.h",
     .run     = gen_version,
 );
 
 NOB_ARTIFACT(core,
-    .sources = SRCS("src/core.c", "src/util.c"),
-    .output  = "build/libcore.a",
-    .type    = TARGET_STATIC_LIB,
-    .cflags  = FLAGS("-Isrc"),
+    .sources     = SRCS("src/core.c", "src/util.c"),
+    .inputs      = INPUTS("src/core.h"),
+    .output      = BUILD_DIR "/libcore.a",
+    .type        = TARGET_STATIC_LIB,
+    .cflags      = FLAGS("-Isrc"),
+    .description = "core static library",
 );
 
 NOB_ARTIFACT(myapp,
     .sources        = SRCS("src/main.c"),
-    .output         = "myapp",
+    .inputs         = INPUTS("src/core.h", BUILD_DIR "/version.h"),
+    .output         = BUILD_DIR "/myapp",
     .type           = TARGET_EXECUTABLE,
     .deps           = DEPS("core", "version_h"),
-    .cflags         = FLAGS("-Isrc", "-Ibuild"),
-    .lflags         = FLAGS("-Lbuild", "-lcore"),
+    .cflags         = FLAGS("-Isrc", "-I" BUILD_DIR),
+    .lflags         = FLAGS("-L" BUILD_DIR, "-lcore"),
     .groups         = GROUPS("build", "ci"),
     .description    = "main application binary",
     .on_after_build = after_deploy,
@@ -503,29 +624,30 @@ NOB_ARTIFACT(myapp,
 
 NOB_ARTIFACT(tests,
     .sources     = SRCS("tests/test_core.c"),
-    .output      = "tests/test_core",
+    .output      = BUILD_DIR "/tests",
     .type        = TARGET_EXECUTABLE,
     .deps        = DEPS("core"),
     .cflags      = FLAGS("-Isrc"),
-    .lflags      = FLAGS("-Lbuild", "-lcore"),
+    .lflags      = FLAGS("-L" BUILD_DIR, "-lcore"),
     .groups      = GROUPS("test"),
     .description = "core unit tests",
 );
 
-NOB_PHONY(clean,     .description = "remove build artifacts");
-NOB_PHONY(install,   .deps = DEPS("myapp"), .description = "install myapp to /usr/local/bin");
-NOB_PHONY(run_tests, .groups = GROUPS("test"), .description = "build and run tests");
+NOB_PHONY(clean,     .groups = GROUPS("clean"),       .description = "remove build artifacts");
+NOB_PHONY(install,   .deps = DEPS("myapp"),           .description = "install myapp to /usr/local/bin");
+NOB_PHONY(run_tests, .groups = GROUPS("test"),        .description = "build and run tests");
 ```
 
 ```sh
 cc build.c -o build -lpthread
 
-./build              # compiles core + myapp, calls after_deploy
-./build test         # compiles tests, runs test binary
-./build clean
-./build install
+./build               # compiles core + myapp, calls after_deploy
+./build @test         # compiles tests, runs test binary
+./build clean         # removes build artifacts
+./build install       # installs myapp
 ./build --watch
-./build -j2 ci
-./build --dry-run ci
+./build -j2 @ci
+./build --dry-run @ci
 ./build --list
+./build --version
 ```

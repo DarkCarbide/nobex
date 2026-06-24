@@ -78,6 +78,9 @@
 
 #ifndef _WIN32
 #  include <pthread.h>
+#  include <glob.h>
+#  include <unistd.h>
+#  include <pwd.h>
 #endif
 
 /* =========================================================
@@ -129,10 +132,35 @@ typedef struct NobexTarget NobexTarget;
  * ========================================================= */
 
 /* Forward declarations for cross-references */
-typedef struct NobexContext NobexContext;
-typedef struct NobexStore   NobexStore;
-typedef struct NobexWatch   NobexWatch;
-typedef struct NobexGraph   NobexGraph;
+typedef struct NobexContext    NobexContext;
+typedef struct NobexStore      NobexStore;
+typedef struct NobexWatch      NobexWatch;
+typedef struct NobexGraph      NobexGraph;
+typedef struct NobexCompileCtx NobexCompileCtx;
+typedef struct NobexLinkCtx    NobexLinkCtx;
+typedef struct NobexPipeline   NobexPipeline;
+
+struct NobexCompileCtx {
+    NobexTarget  *target;
+    NobexContext *ctx;
+    const char   *src;
+    const char   *obj;
+    const char  **cflags;  /* already expanded */
+    Nob_Cmd      *cmd;     /* handler populates; nobex runs/prints/frees */
+};
+
+struct NobexLinkCtx {
+    NobexTarget  *target;
+    NobexContext *ctx;
+    const char  **objs;
+    const char  **lflags;  /* already expanded */
+    Nob_Cmd      *cmd;     /* handler populates; nobex runs/prints/frees */
+};
+
+struct NobexPipeline {
+    void (*compile)(NobexCompileCtx *pctx);
+    void (*link)(NobexLinkCtx *pctx);
+};
 
 typedef enum {
     TARGET_EXECUTABLE,
@@ -173,7 +201,9 @@ struct NobexTarget {
     const char  **packages;
     const char  **groups;
     bool          use_xflags;
+    NobexPipeline pipeline;
     NobexWatch    watch;
+    const char  **vars;   /* variable names consumed by this target, shown in --help */
     bool        (*run)(NobexTarget*, NobexContext*);
     bool        (*phony)(NobexContext*);
     void        (*on_before_build)(NobexTarget*, NobexContext*);
@@ -240,6 +270,7 @@ struct NobexContext {
 #define PKGS(...)   LIST(__VA_ARGS__)
 #define GROUPS(...) LIST(__VA_ARGS__)
 #define INPUTS(...) LIST(__VA_ARGS__)
+#define VARS(...)   LIST(__VA_ARGS__)
 
 /* =========================================================
  * H — Public API declarations
@@ -253,6 +284,8 @@ const char *nobex_get(NobexContext *ctx, const char *key);
 NobexTarget     *nobex_find(NobexContext *ctx, const char *name);
 bool        nobex_run(NobexContext *ctx, const char *name);
 const char *nobex_output(NobexContext *ctx, const char *name);
+bool        nobex_cleanup_impl(const char *first, ...);
+#define     nobex_cleanup(first, ...) nobex_cleanup_impl(first, ##__VA_ARGS__, NULL)
 
 /* xflags API — reads //> key : value lines from the top of C source files */
 const char *nobex_xflags_get(const char *filepath, const char *key);
@@ -317,6 +350,28 @@ const char *nobex_get(NobexContext *ctx, const char *key)
         if (strcmp(s->keys[i], key) == 0) return s->values[i];
     }
     return NULL;
+}
+
+/* ── Path expansion ── */
+
+static NOBEX__UNUSED const char *_nobex_expand_path(const char *path)
+{
+    if (!path || path[0] != '~') return path;
+#ifdef _WIN32
+    const char *home = getenv("USERPROFILE");
+    if (!home) home = getenv("HOMEDRIVE");  /* best-effort fallback */
+#else
+    const char *home = getenv("HOME");
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+    }
+#endif
+    if (!home) return path;
+    if (path[1] == '\0') return home;
+    if (path[1] == '/' || path[1] == '\\')
+        return nob_temp_sprintf("%s%s", home, path + 1);
+    return path;
 }
 
 /* ── xflags parser ──
@@ -412,6 +467,45 @@ const char *nobex_output(NobexContext *ctx, const char *name)
 {
     NobexTarget *t = _nobex_graph_find(ctx->graph, name);
     return t ? t->output : NULL;
+}
+
+bool nobex_cleanup_impl(const char *first, ...)
+{
+    bool ok = true;
+    va_list ap;
+    va_start(ap, first);
+    const char *pattern = first;
+    while (pattern != NULL) {
+#ifdef _WIN32
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pattern, &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        /* extract directory prefix from pattern */
+        const char *slash = strrchr(pattern, '/');
+        const char *bslash = strrchr(pattern, '\\');
+        const char *sep = slash > bslash ? slash : bslash;
+        char dir[512] = {0};
+        if (sep) { size_t dlen = (size_t)(sep - pattern) + 1; if (dlen < sizeof(dir)) { memcpy(dir, pattern, dlen); dir[dlen] = '\0'; } }
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s%s", dir, fd.cFileName);
+            if (!nob_delete_file(path)) ok = false;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+#else
+        glob_t gs = {0};
+        int r = glob(pattern, GLOB_NOSORT, NULL, &gs);
+        if (r == GLOB_NOMATCH) { globfree(&gs); continue; }
+        if (r != 0)            { globfree(&gs); ok = false; continue; }
+        for (size_t i = 0; i < gs.gl_pathc; i++)
+            if (!nob_delete_file(gs.gl_pathv[i])) ok = false;
+        globfree(&gs);
+#endif
+        pattern = va_arg(ap, const char *);
+    }
+    va_end(ap);
+    return ok;
 }
 
 typedef enum { NOBEX_UNVISITED = 0, NOBEX_IN_PROGRESS, NOBEX_DONE } _NobexVisit;
@@ -577,6 +671,243 @@ static NOBEX__UNUSED bool _nobex_needs_rebuild(NobexTarget *t, NobexContext *ctx
     return r < 0 ? true : (bool)r;
 }
 
+/* ── Built-in pipeline implementations ── */
+
+static NOBEX__UNUSED void _nobex_default_compile(NobexCompileCtx *pctx)
+{
+    nob_cc(pctx->cmd);
+    if (pctx->cflags)
+        for (size_t i = 0; pctx->cflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->cflags[i]);
+    nob_cmd_append(pctx->cmd, "-c", pctx->src);
+    nob_cc_output(pctx->cmd, pctx->obj);
+}
+
+static NOBEX__UNUSED void _nobex_default_link(NobexLinkCtx *pctx)
+{
+    nob_cc(pctx->cmd);
+    if (pctx->objs)
+        for (size_t i = 0; pctx->objs[i]; i++) nob_cmd_append(pctx->cmd, pctx->objs[i]);
+    nob_cc_output(pctx->cmd, pctx->target->output ? pctx->target->output : "a.out");
+    if (pctx->lflags)
+        for (size_t i = 0; pctx->lflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->lflags[i]);
+}
+
+#define _NOBEX_MAKE_PIPELINE(cc_bin)                                              \
+static NOBEX__UNUSED void _nobex_compile_##cc_bin(NobexCompileCtx *pctx)         \
+{                                                                                  \
+    nob_cmd_append(pctx->cmd, #cc_bin);                                           \
+    if (pctx->cflags)                                                             \
+        for (size_t i = 0; pctx->cflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->cflags[i]); \
+    nob_cmd_append(pctx->cmd, "-c", pctx->src, "-o", pctx->obj);                 \
+}                                                                                  \
+static NOBEX__UNUSED void _nobex_link_##cc_bin(NobexLinkCtx *pctx)               \
+{                                                                                  \
+    nob_cmd_append(pctx->cmd, #cc_bin);                                           \
+    if (pctx->objs)                                                               \
+        for (size_t i = 0; pctx->objs[i]; i++) nob_cmd_append(pctx->cmd, pctx->objs[i]); \
+    nob_cmd_append(pctx->cmd, "-o", pctx->target->output ? pctx->target->output : "a.out"); \
+    if (pctx->lflags)                                                             \
+        for (size_t i = 0; pctx->lflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->lflags[i]); \
+}
+
+_NOBEX_MAKE_PIPELINE(gcc)
+_NOBEX_MAKE_PIPELINE(clang)
+
+/* g++ pipeline — macro can't stringify "g++" directly */
+static NOBEX__UNUSED void _nobex_compile_gpp(NobexCompileCtx *pctx)
+{
+    nob_cmd_append(pctx->cmd, "g++");
+    if (pctx->cflags)
+        for (size_t i = 0; pctx->cflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->cflags[i]);
+    nob_cmd_append(pctx->cmd, "-c", pctx->src, "-o", pctx->obj);
+}
+
+static NOBEX__UNUSED void _nobex_link_gpp(NobexLinkCtx *pctx)
+{
+    nob_cmd_append(pctx->cmd, "g++");
+    if (pctx->objs)
+        for (size_t i = 0; pctx->objs[i]; i++) nob_cmd_append(pctx->cmd, pctx->objs[i]);
+    nob_cmd_append(pctx->cmd, "-o", pctx->target->output ? pctx->target->output : "a.out");
+    if (pctx->lflags)
+        for (size_t i = 0; pctx->lflags[i]; i++) nob_cmd_append(pctx->cmd, pctx->lflags[i]);
+}
+
+#ifdef NOBEX_IMPLEMENTATION
+
+const NobexPipeline nobex_default_pipeline = { _nobex_default_compile, _nobex_default_link };
+const NobexPipeline nobex_pipeline_gcc     = { _nobex_compile_gcc,     _nobex_link_gcc     };
+const NobexPipeline nobex_pipeline_clang   = { _nobex_compile_clang,   _nobex_link_clang   };
+const NobexPipeline nobex_pipeline_gpp     = { _nobex_compile_gpp,     _nobex_link_gpp     };
+
+#else
+
+extern const NobexPipeline nobex_default_pipeline;
+extern const NobexPipeline nobex_pipeline_gcc;
+extern const NobexPipeline nobex_pipeline_clang;
+extern const NobexPipeline nobex_pipeline_gpp;
+
+#endif
+
+/* ── Parallel compile helper ─────────────────────────────────────────────────
+ * Compiles all sources that need rebuilding, up to ctx->jobs at a time.
+ * On POSIX: fork()+waitpid() pool. On Windows: falls back to serial.
+ * Returns false if any compilation fails.
+ * objs[] must already be filled (nsrc entries + NULL sentinel).
+ * exp_cflags[] must already be expanded.
+ * --------------------------------------------------------------------------- */
+static NOBEX__UNUSED bool _nobex_compile_sources(
+        NobexTarget *t, NobexContext *ctx,
+        size_t nsrc, const char **objs,
+        size_t ncf,  const char **exp_cflags,
+        void (*do_compile)(NobexCompileCtx*))
+{
+    size_t ninp = 0;
+    if (t->inputs) while (t->inputs[ninp]) ninp++;
+
+#ifndef _WIN32
+    int jobs = ctx->jobs > 1 ? ctx->jobs : 1;
+    /* pids[i] == -1  → slot free
+     * pids[i] == 0   → source i does not need rebuild
+     * pids[i] >  0   → child pid compiling source i */
+    pid_t  *pids    = (pid_t  *)NOB_REALLOC(NULL, nsrc * sizeof(pid_t));
+    bool   *needed  = (bool   *)NOB_REALLOC(NULL, nsrc * sizeof(bool));
+    bool    ok      = true;
+    int     running = 0;
+
+    /* determine which sources need rebuilding */
+    for (size_t i = 0; i < nsrc; i++) {
+        pids[i] = -1;
+        const char *src = t->sources[i];
+        const char *obj = objs[i];
+        const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
+        chk[0] = src;
+        for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
+        int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
+        NOB_FREE(chk);
+        if (needs < 0) { NOB_FREE(pids); NOB_FREE(needed); return false; }
+        needed[i] = (needs || !nob_file_exists(obj));
+    }
+
+    size_t next = 0; /* next source index to dispatch */
+    while (ok && (running > 0 || next < nsrc)) {
+        /* fill available slots */
+        while (running < jobs && next < nsrc) {
+            if (!needed[next]) { next++; continue; }
+            const char *src = t->sources[next];
+            const char *obj = objs[next];
+            size_t extra = 0;
+            const char *xf = t->use_xflags ? nobex_xflags_get(src, "cflags") : NULL;
+            if (xf) extra = 1;
+            const char **src_cflags = (const char **)NOB_REALLOC(NULL, (ncf + extra + 1) * sizeof(char *));
+            for (size_t j = 0; j < ncf; j++) src_cflags[j] = exp_cflags[j];
+            if (xf) src_cflags[ncf] = xf;
+            src_cflags[ncf + extra] = NULL;
+
+            Nob_Cmd cmd = {0};
+            NobexCompileCtx pctx = { t, ctx, src, obj, src_cflags, &cmd };
+            do_compile(&pctx);
+            NOB_FREE(src_cflags);
+
+            if (ctx->dry_run) {
+                Nob_String_Builder sb = {0};
+                nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
+                printf("[dry-run] %s\n", sb.items);
+                NOB_FREE(sb.items); NOB_FREE(cmd.items);
+                pids[next] = -1;
+            } else {
+                /* log the command like nob does before forking */
+                {
+                    Nob_String_Builder sb = {0};
+                    nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
+                    nob_log(NOB_INFO, "CMD: %s", sb.items);
+                    NOB_FREE(sb.items);
+                }
+                pid_t pid = fork();
+                if (pid < 0) {
+                    nob_log(NOB_ERROR, "fork: %s", strerror(errno));
+                    NOB_FREE(cmd.items); ok = false; break;
+                }
+                if (pid == 0) {
+                    /* child: exec the command */
+                    const char **args = (const char **)NOB_REALLOC(NULL, (cmd.count + 1) * sizeof(char *));
+                    for (size_t k = 0; k < cmd.count; k++) args[k] = cmd.items[k];
+                    args[cmd.count] = NULL;
+                    execvp(args[0], (char *const *)args);
+                    fprintf(stderr, "execvp %s: %s\n", args[0], strerror(errno));
+                    exit(1);
+                }
+                NOB_FREE(cmd.items);
+                pids[next] = pid;
+                running++;
+            }
+            next++;
+        }
+
+        if (running == 0) break;
+
+        /* wait for any one child */
+        int status;
+        pid_t done = waitpid(-1, &status, 0);
+        if (done < 0) { nob_log(NOB_ERROR, "waitpid: %s", strerror(errno)); ok = false; break; }
+        running--;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            nob_log(NOB_ERROR, "nobex: compilation failed (pid %d)", (int)done);
+            ok = false;
+        }
+        /* mark that slot free */
+        for (size_t i = 0; i < nsrc; i++) if (pids[i] == done) { pids[i] = -1; break; }
+    }
+
+    /* drain remaining children on failure */
+    if (!ok) {
+        int status;
+        while (running-- > 0) waitpid(-1, &status, 0);
+    }
+
+    NOB_FREE(pids); NOB_FREE(needed);
+    return ok;
+
+#else
+    /* Windows fallback: serial */
+    for (size_t i = 0; i < nsrc; i++) {
+        const char *src = t->sources[i];
+        const char *obj = objs[i];
+        const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
+        chk[0] = src;
+        for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
+        int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
+        NOB_FREE(chk);
+        if (needs < 0) return false;
+        if (!needs && nob_file_exists(obj)) continue;
+
+        size_t extra = 0;
+        const char *xf = t->use_xflags ? nobex_xflags_get(src, "cflags") : NULL;
+        if (xf) extra = 1;
+        const char **src_cflags = (const char **)NOB_REALLOC(NULL, (ncf + extra + 1) * sizeof(char *));
+        for (size_t j = 0; j < ncf; j++) src_cflags[j] = exp_cflags[j];
+        if (xf) src_cflags[ncf] = xf;
+        src_cflags[ncf + extra] = NULL;
+
+        Nob_Cmd cmd = {0};
+        NobexCompileCtx pctx = { t, ctx, src, obj, src_cflags, &cmd };
+        do_compile(&pctx);
+        NOB_FREE(src_cflags);
+
+        if (ctx->dry_run) {
+            Nob_String_Builder sb = {0};
+            nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
+            printf("[dry-run] %s\n", sb.items);
+            NOB_FREE(sb.items); NOB_FREE(cmd.items);
+        } else {
+            bool r = nob_cmd_run(&cmd);
+            NOB_FREE(cmd.items);
+            if (!r) return false;
+        }
+    }
+    return true;
+#endif
+}
+
 static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *ctx)
 {
     Nob_Log_Level saved = nob_minimal_log_level;
@@ -584,133 +915,132 @@ static NOBEX__UNUSED bool _nobex_build_executable(NobexTarget *t, NobexContext *
     nob_mkdir_if_not_exists("build");
     nob_minimal_log_level = saved;
 
-    const char *output = t->output ? t->output : "a.out";
+    void (*do_compile)(NobexCompileCtx*) = t->pipeline.compile ? t->pipeline.compile : _nobex_default_compile;
+    void (*do_link)(NobexLinkCtx*)       = t->pipeline.link    ? t->pipeline.link    : _nobex_default_link;
 
-    /* compile each source to an object file */
+    /* build expanded cflags array (cflags + xflags + packages) */
+    size_t ncf = 0;
+    if (t->cflags) while (t->cflags[ncf]) ncf++;
+    const char **exp_cflags = (const char **)NOB_REALLOC(NULL, (ncf + 2) * sizeof(char *));
+    for (size_t j = 0; j < ncf; j++) exp_cflags[j] = _nobex_expand(t->cflags[j], ctx);
+    exp_cflags[ncf] = NULL;
+
+    /* build expanded lflags array */
+    size_t nlf = 0;
+    if (t->lflags) while (t->lflags[nlf]) nlf++;
+    const char **exp_lflags = (const char **)NOB_REALLOC(NULL, (nlf + 2) * sizeof(char *));
+    for (size_t j = 0; j < nlf; j++) exp_lflags[j] = _nobex_expand(t->lflags[j], ctx);
+    exp_lflags[nlf] = NULL;
+
+    /* collect obj paths */
+    size_t nsrc = 0;
+    if (t->sources) while (t->sources[nsrc]) nsrc++;
+    const char **objs = (const char **)NOB_REALLOC(NULL, (nsrc + 1) * sizeof(char *));
+    for (size_t i = 0; i < nsrc; i++) {
+        const char *base = nob_path_name(t->sources[i]);
+        objs[i] = nob_temp_sprintf("build/%s.o", base);
+    }
+    objs[nsrc] = NULL;
+
+    /* compile step */
     if (t->sources) {
+        if (!_nobex_compile_sources(t, ctx, nsrc, objs, ncf, exp_cflags, do_compile)) {
+            NOB_FREE(exp_cflags); NOB_FREE(exp_lflags); NOB_FREE(objs);
+            return false;
+        }
+    }
+
+    /* append package lflags and xflags lflags */
+    size_t total_lf = nlf;
+    if (t->packages) {
+        for (size_t j = 0; t->packages[j]; j++) {
+            Nob_String_Builder pl = {0};
+            if (!_nobex_pkg_config(t->packages[j], false, &pl)) {
+                NOB_FREE(exp_cflags); NOB_FREE(exp_lflags); NOB_FREE(objs); return false;
+            }
+            nob_sb_append_null(&pl);
+            exp_lflags = (const char **)NOB_REALLOC(exp_lflags, (total_lf + 2) * sizeof(char *));
+            exp_lflags[total_lf++] = pl.items;
+            exp_lflags[total_lf]   = NULL;
+        }
+    }
+    if (t->use_xflags && t->sources) {
         for (size_t i = 0; t->sources[i]; i++) {
-            const char *src  = t->sources[i];
-            const char *base = nob_path_name(src);
-            const char *obj  = nob_temp_sprintf("build/%s.o", base);
-
-            size_t ninp = 0;
-            if (t->inputs) while (t->inputs[ninp]) ninp++;
-            const char **chk = (const char **)NOB_REALLOC(NULL, (1 + ninp) * sizeof(char *));
-            chk[0] = src;
-            for (size_t k = 0; k < ninp; k++) chk[1 + k] = t->inputs[k];
-            int needs = ctx->force ? 1 : nob_needs_rebuild(obj, chk, 1 + ninp);
-            NOB_FREE(chk);
-            if (needs < 0) return false;
-
-            if (needs || !nob_file_exists(obj)) {
-                Nob_Cmd cmd = {0};
-                nob_cc(&cmd);
-                if (t->cflags) {
-                    for (size_t j = 0; t->cflags[j]; j++)
-                        nob_cmd_append(&cmd, _nobex_expand(t->cflags[j], ctx));
-                }
-                if (t->use_xflags) {
-                    const char *xf = nobex_xflags_get(src, "cflags");
-                    if (xf) nob_cmd_append(&cmd, xf);
-                }
-                nob_cmd_append(&cmd, "-c", src);
-                nob_cc_output(&cmd, obj);
-                if (t->packages) {
-                    for (size_t j = 0; t->packages[j]; j++) {
-                        Nob_String_Builder pf = {0};
-                        if (!_nobex_pkg_config(t->packages[j], true, &pf)) return false;
-                        nob_sb_append_null(&pf);
-                        nob_cmd_append(&cmd, pf.items);
-                    }
-                }
-
-                if (ctx->dry_run) {
-                    Nob_String_Builder r = {0};
-                    nob_cmd_render(cmd, &r); nob_sb_append_null(&r);
-                    printf("[dry-run] %s\n", r.items);
-                    NOB_FREE(r.items);
-                } else {
-                    if (!nob_cmd_run(&cmd)) return false;
-                }
+            const char *xl = nobex_xflags_get(t->sources[i], "libs");
+            if (xl) {
+                exp_lflags = (const char **)NOB_REALLOC(exp_lflags, (total_lf + 2) * sizeof(char *));
+                exp_lflags[total_lf++] = xl;
+                exp_lflags[total_lf]   = NULL;
             }
         }
     }
 
-    /* link */
+    /* link step */
     {
         Nob_Cmd cmd = {0};
-        nob_cc(&cmd);
-        if (t->sources) {
-            for (size_t i = 0; t->sources[i]; i++) {
-                const char *base = nob_path_name(t->sources[i]);
-                nob_cmd_append(&cmd, nob_temp_sprintf("build/%s.o", base));
-            }
-        }
-        nob_cc_output(&cmd, output);
-        if (t->lflags) {
-            for (size_t j = 0; t->lflags[j]; j++)
-                nob_cmd_append(&cmd, _nobex_expand(t->lflags[j], ctx));
-        }
-        if (t->packages) {
-            for (size_t j = 0; t->packages[j]; j++) {
-                Nob_String_Builder pl = {0};
-                if (!_nobex_pkg_config(t->packages[j], false, &pl)) return false;
-                nob_sb_append_null(&pl);
-                nob_cmd_append(&cmd, pl.items);
-            }
-        }
-        if (t->use_xflags && t->sources) {
-            for (size_t i = 0; t->sources[i]; i++) {
-                const char *xl = nobex_xflags_get(t->sources[i], "libs");
-                if (xl) nob_cmd_append(&cmd, xl);
-            }
-        }
+        NobexLinkCtx lpctx = { t, ctx, objs, exp_lflags, &cmd };
+        do_link(&lpctx);
 
+        bool ok;
         if (ctx->dry_run) {
-            Nob_String_Builder r = {0};
-            nob_cmd_render(cmd, &r); nob_sb_append_null(&r);
-            printf("[dry-run] %s\n", r.items);
-            NOB_FREE(r.items);
-            return true;
+            Nob_String_Builder sb = {0};
+            nob_cmd_render(cmd, &sb); nob_sb_append_null(&sb);
+            printf("[dry-run] %s\n", sb.items);
+            NOB_FREE(sb.items); ok = true;
+        } else {
+            ok = nob_cmd_run(&cmd);
         }
-        if (!nob_cmd_run(&cmd)) return false;
+        NOB_FREE(cmd.items);
+        NOB_FREE(exp_cflags); NOB_FREE(exp_lflags); NOB_FREE(objs);
+        return ok;
     }
-    return true;
 }
 
 static NOBEX__UNUSED bool _nobex_build_static_lib(NobexTarget *t, NobexContext *ctx)
 {
     nob_mkdir_if_not_exists("build");
     const char *output = t->output ? t->output : "build/libout.a";
-    const char *obj    = nob_temp_sprintf("%s.o", output);
 
-    Nob_Cmd cmd = {0};
-    nob_cc(&cmd);
-    nob_cmd_append(&cmd, "-c");
-    if (t->cflags) {
-        for (size_t j = 0; t->cflags[j]; j++)
-            nob_cmd_append(&cmd, _nobex_expand(t->cflags[j], ctx));
+    void (*do_compile)(NobexCompileCtx*) = t->pipeline.compile ? t->pipeline.compile : _nobex_default_compile;
+
+    /* build expanded cflags */
+    size_t ncf = 0;
+    if (t->cflags) while (t->cflags[ncf]) ncf++;
+    const char **exp_cflags = (const char **)NOB_REALLOC(NULL, (ncf + 1) * sizeof(char *));
+    for (size_t j = 0; j < ncf; j++) exp_cflags[j] = _nobex_expand(t->cflags[j], ctx);
+    exp_cflags[ncf] = NULL;
+
+    /* collect obj paths */
+    size_t nsrc = 0;
+    if (t->sources) while (t->sources[nsrc]) nsrc++;
+    const char **objs = (const char **)NOB_REALLOC(NULL, (nsrc + 1) * sizeof(char *));
+    for (size_t i = 0; i < nsrc; i++) {
+        const char *base = nob_path_name(t->sources[i]);
+        objs[i] = nob_temp_sprintf("build/%s.o", base);
     }
-    if (t->sources) {
-        for (size_t i = 0; t->sources[i]; i++) {
-            nob_cmd_append(&cmd, t->sources[i]);
-            if (t->use_xflags) {
-                const char *xf = nobex_xflags_get(t->sources[i], "cflags");
-                if (xf) nob_cmd_append(&cmd, xf);
-            }
-        }
+    objs[nsrc] = NULL;
+
+    /* compile each source individually, in parallel if ctx->jobs > 1 */
+    if (!_nobex_compile_sources(t, ctx, nsrc, objs, ncf, exp_cflags, do_compile)) {
+        NOB_FREE(exp_cflags); NOB_FREE(objs);
+        return false;
     }
-    nob_cmd_append(&cmd, "-o", obj);
+
+    NOB_FREE(exp_cflags);
 
     if (ctx->dry_run) {
-        Nob_String_Builder r = {0}; nob_cmd_render(cmd, &r); nob_sb_append_null(&r);
-        printf("[dry-run] %s\n", r.items); NOB_FREE(r.items); return true;
+        printf("[dry-run] %s rcs %s ...\n", NOBEX_AR, output);
+        NOB_FREE(objs);
+        return true;
     }
-    if (!nob_cmd_run(&cmd)) return false;
 
+    /* archive all objects */
     Nob_Cmd ar = {0};
-    nob_cmd_append(&ar, NOBEX_AR, "rcs", output, obj);
-    return nob_cmd_run(&ar);
+    nob_cmd_append(&ar, NOBEX_AR, "rcs", output);
+    for (size_t i = 0; i < nsrc; i++) nob_cmd_append(&ar, objs[i]);
+    bool ok = nob_cmd_run(&ar);
+    NOB_FREE(ar.items); NOB_FREE(objs);
+    return ok;
 }
 
 static NOBEX__UNUSED bool _nobex_build_shared_lib(NobexTarget *t, NobexContext *ctx)
@@ -907,60 +1237,102 @@ bool nobex_run(NobexContext *ctx, const char *name)
 
 /* ── --help and --list ── */
 
-static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_group, const char *prog)
+static NOBEX__UNUSED void _nobex_print_target_detail(NobexTarget *t, const char *default_group)
+{
+    const char *ts = "Executable";
+    switch (t->type) {
+        case TARGET_STATIC_LIB: ts = "Static lib"; break;
+        case TARGET_SHARED_LIB: ts = "Shared lib"; break;
+        case TARGET_RULE:       ts = "Rule";       break;
+        case TARGET_PHONY:      ts = "Phony";      break;
+        default: break;
+    }
+    printf("    %-20s %-12s", t->name, ts);
+    if (t->description) printf("  %s", t->description);
+    printf("\n");
+    /* groups */
+    const char *_dg_arr[2] = { default_group, NULL };
+    const char **gs = t->groups ? t->groups : _dg_arr;
+    printf("      groups:");
+    for (size_t k = 0; gs[k]; k++) printf(" @%s", gs[k]);
+    printf("\n");
+    /* deps */
+    if (t->deps) {
+        printf("      deps:");
+        for (size_t k = 0; t->deps[k]; k++) printf(" %s", t->deps[k]);
+        printf("\n");
+    }
+    /* vars */
+    if (t->vars) {
+        printf("      vars:");
+        for (size_t k = 0; t->vars[k]; k++) printf("  %s=<value>", t->vars[k]);
+        printf("\n");
+    }
+}
+
+/* nfocused == 0 → full help; nfocused > 0 → show only matching targets, no groups/arguments sections */
+static NOBEX__UNUSED void _nobex_print_help(NobexGraph *g, const char *default_group,
+                                             const char *prog,
+                                             const char **focused, size_t nfocused)
 {
     printf("Usage: %s [flags] [target|@group...]\n\n", prog);
-    const char *seen[256]; size_t n = 0;
 
-    for (size_t i = 0; i < g->count; i++) {
-        NobexTarget *t = g->items[i];
-        const char *_dg = _nobex_default_group ? _nobex_default_group : "build";
-        const char *_dg_arr[2] = { _dg, NULL };
-        const char **gs = t->groups ? t->groups : _dg_arr;
-        for (size_t k = 0; gs[k]; k++) {
-            bool found = false;
-            for (size_t j = 0; j < n; j++) if (strcmp(seen[j], gs[k]) == 0) { found = true; break; }
-            if (!found && n < 256) seen[n++] = gs[k];
-        }
-    }
-
-    printf("Groups:\n");
-    for (size_t gi = 0; gi < n; gi++) {
-        const char *grp = seen[gi];
-        printf("    %-20s%s  ", grp, strcmp(grp, default_group) == 0 ? "(default) " : "          ");
-        bool first = true;
+    if (nfocused == 0) {
+        /* collect group names */
+        const char *seen[256]; size_t n = 0;
         for (size_t i = 0; i < g->count; i++) {
-            if (_nobex_target_in_group(g->items[i], grp)) {
-                if (!first) printf(", ");
-                printf("%s", g->items[i]->name);
-                first = false;
+            NobexTarget *t = g->items[i];
+            const char *_dg_arr[2] = { default_group, NULL };
+            const char **gs = t->groups ? t->groups : _dg_arr;
+            for (size_t k = 0; gs[k]; k++) {
+                bool found = false;
+                for (size_t j = 0; j < n; j++) if (strcmp(seen[j], gs[k]) == 0) { found = true; break; }
+                if (!found && n < 256) seen[n++] = gs[k];
             }
         }
-        printf("\n");
-    }
-
-    printf("\nTargets:\n");
-    for (size_t i = 0; i < g->count; i++) {
-        NobexTarget *t = g->items[i];
-        const char *ts = "Executable";
-        switch (t->type) {
-            case TARGET_STATIC_LIB: ts = "Static lib"; break;
-            case TARGET_SHARED_LIB: ts = "Shared lib"; break;
-            case TARGET_RULE:       ts = "Rule";       break;
-            case TARGET_PHONY:      ts = "Phony";      break;
-            default: break;
+        printf("Groups:\n");
+        for (size_t gi = 0; gi < n; gi++) {
+            const char *grp = seen[gi];
+            printf("    %-20s%s  ", grp, strcmp(grp, default_group) == 0 ? "(default) " : "          ");
+            bool first = true;
+            for (size_t i = 0; i < g->count; i++) {
+                if (_nobex_target_in_group(g->items[i], grp)) {
+                    if (!first) printf(", ");
+                    printf("%s", g->items[i]->name);
+                    first = false;
+                }
+            }
+            printf("\n");
         }
-        printf("    %-20s %-12s", t->name, ts);
-        if (t->use_xflags) printf(" xflags:on");
-        if (!t->watch.skip && t->type != TARGET_PHONY) printf(" watch:on");
-        printf("\n");
+        printf("\nTargets:\n");
+        for (size_t i = 0; i < g->count; i++)
+            _nobex_print_target_detail(g->items[i], default_group);
+        printf("\nArguments:\n");
+        printf("    target         Build a named target directly\n");
+        printf("    @group         Build all targets in a group\n");
+        printf("    key=value      Set a variable consumed by a target (e.g. install_dir=~/tools)\n");
+    } else {
+        /* focused: only matching targets, no groups or arguments sections */
+        bool any = false;
+        for (size_t i = 0; i < g->count; i++) {
+            NobexTarget *t = g->items[i];
+            for (size_t f = 0; f < nfocused; f++) {
+                const char *a = focused[f];
+                bool matches = (a[0] == '@')
+                    ? _nobex_target_in_group(t, a + 1)
+                    : strcmp(t->name, a) == 0;
+                if (matches) {
+                    if (!any) { printf("Targets:\n"); any = true; }
+                    _nobex_print_target_detail(t, default_group);
+                    break;
+                }
+            }
+        }
     }
 
-    printf("\nArguments:\n");
-    printf("    target         Build a named target directly\n");
-    printf("    @group         Build all targets in a group\n");
     printf("\nFlags:\n");
-    printf("    --help, -h     Show this help\n");
+    printf("    --version, -V  Show build timestamp\n");
+    printf("    --help, -h     Show this help; combine with targets/groups for details\n");
     printf("    --list, -l     List targets\n");
     printf("    -jN            Parallelism (e.g. -j4)\n");
     printf("    -B             Force rebuild, ignore mtimes\n");
@@ -980,6 +1352,10 @@ static NOBEX__UNUSED void _nobex_print_list(NobexGraph *g)
             printf("]");
         } else { printf("  [%s]", _nobex_default_group ? _nobex_default_group : "build"); }
         if (t->description) printf("  %s", t->description);
+        if (t->vars) {
+            printf("  vars:");
+            for (size_t k = 0; t->vars[k]; k++) printf(" %s", t->vars[k]);
+        }
         printf("\n");
     }
 }
@@ -1148,15 +1524,16 @@ int main(int argc, char **argv)
     if (!_nobex_validate_graph(&g)) return 1;
 
     bool dry_run = false, verbose = false, watch = false, force = false;
-    bool show_help = false, show_list = false;
+    bool show_help = false, show_list = false, show_version = false;
     int  jobs = 1;
     const char *req_args[64];  /* positional args: "name" = target, "@group" = group */
     size_t nargs = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if      (strcmp(a, "--help")    == 0 || strcmp(a, "-h") == 0) show_help = true;
-        else if (strcmp(a, "--list")    == 0 || strcmp(a, "-l") == 0) show_list = true;
+        if      (strcmp(a, "--help")    == 0 || strcmp(a, "-h") == 0) show_help    = true;
+        else if (strcmp(a, "--list")    == 0 || strcmp(a, "-l") == 0) show_list    = true;
+        else if (strcmp(a, "--version") == 0 || strcmp(a, "-V") == 0) show_version = true;
         else if (strcmp(a, "--dry-run") == 0) dry_run = true;
         else if (strcmp(a, "--verbose") == 0 || strcmp(a, "-v") == 0) verbose = true;
         else if (strcmp(a, "--watch")   == 0) watch = true;
@@ -1174,9 +1551,41 @@ int main(int argc, char **argv)
         }
     }
 
+    /* split req_args into key=value pairs (store) and positional targets */
+    const char *cli_var_keys[64];
+    const char *cli_var_vals[64];
+    size_t      nvars = 0;
+    const char *pos_args[64];
+    size_t      npos = 0;
+    for (size_t i = 0; i < nargs; i++) {
+        const char *a  = req_args[i];
+        const char *eq = strchr(a, '=');
+        if (eq && eq != a && a[0] != '@') {
+            /* key=value — only if key contains no spaces/slashes (not a path) */
+            bool valid = true;
+            for (const char *p = a; p < eq; p++) {
+                if (*p == '/' || *p == '\\' || *p == ' ') { valid = false; break; }
+            }
+            if (valid && nvars < 64) {
+                cli_var_keys[nvars] = nob_temp_sprintf("%.*s", (int)(eq - a), a);
+                cli_var_vals[nvars] = eq + 1;
+                nvars++;
+                continue;
+            }
+        }
+        if (npos < 64) pos_args[npos++] = a;
+    }
+    /* rebuild req_args/nargs from positional-only */
+    nargs = npos;
+    for (size_t i = 0; i < npos; i++) req_args[i] = pos_args[i];
+
     const char *default_group = _nobex_default_group ? _nobex_default_group : "build";
 
-    if (show_help) { _nobex_print_help(&g, default_group, argv[0]); return 0; }
+    if (show_version) { printf("nobex built %s %s\n", __DATE__, __TIME__); return 0; }
+    if (show_help) {
+        _nobex_print_help(&g, default_group, argv[0], req_args, nargs);
+        return 0;
+    }
     if (show_list) { _nobex_print_list(&g); return 0; }
 
     /* default: run the default group */
@@ -1186,6 +1595,38 @@ int main(int argc, char **argv)
     NobexContext ctx   = { .graph = &g, .store = &store,
                            .jobs = jobs, .dry_run = dry_run, .verbose = verbose,
                            .force = force };
+
+    /* Collect the set of targets that will run, to validate CLI vars */
+    NobexTarget *will_run[256]; size_t nwill = 0;
+    for (size_t i = 0; i < nargs && nwill < 256; i++) {
+        const char *a = req_args[i];
+        if (a[0] == '@') {
+            const char *grp = a + 1;
+            for (size_t j = 0; j < g.count && nwill < 256; j++)
+                if (_nobex_target_in_group(g.items[j], grp))
+                    will_run[nwill++] = g.items[j];
+        } else {
+            NobexTarget *t = _nobex_graph_find(&g, a);
+            if (t && nwill < 256) will_run[nwill++] = t;
+        }
+    }
+    /* Inject only vars declared by at least one target that will run.
+     * Warn about vars passed on the CLI that no scheduled target declares. */
+    for (size_t i = 0; i < nvars; i++) {
+        bool claimed = false;
+        for (size_t j = 0; j < nwill && !claimed; j++) {
+            NobexTarget *t = will_run[j];
+            if (!t->vars) continue;
+            for (size_t k = 0; t->vars[k] && !claimed; k++)
+                if (strcmp(t->vars[k], cli_var_keys[i]) == 0) claimed = true;
+        }
+        if (claimed) {
+            nobex_set(&ctx, cli_var_keys[i], _nobex_expand_path(cli_var_vals[i]));
+        } else {
+            nob_log(NOB_WARNING, "nobex: variable '%s' is not used by any scheduled target",
+                    cli_var_keys[i]);
+        }
+    }
 
     Nob_Log_Level saved = nob_minimal_log_level;
     nob_minimal_log_level = NOB_WARNING;
@@ -1263,6 +1704,14 @@ int main(int argc, char **argv)
 
 
     nob_shift(argv, argc); /* consume program name */
+
+    /* intercept --version before forwarding to the build script */
+    for (int _i = 0; _i < argc; _i++) {
+        if (strcmp(argv[_i], "--version") == 0 || strcmp(argv[_i], "-V") == 0) {
+            printf("nobex built %s %s\n", __DATE__, __TIME__);
+            return 0;
+        }
+    }
 
     const char *source = NULL;
     if (argc > 0 && strcmp(argv[0], "run") == 0) {
